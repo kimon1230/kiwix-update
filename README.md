@@ -1,6 +1,6 @@
 # Kiwix Update Script
 
-This bash script automates the management and updating of ZIM files for Kiwix offline content servers. I developed it to handle my institutional Kiwix deployment where manually tracking updates across dozens of educational content collections had become impractical.
+This bash script automates the management and updating of ZIM files for Kiwix offline content servers. I developed it to handle my personal Kiwix deployment where manually tracking updates across dozens of educational content collections had become impractical.
 
 The script provides intelligent update detection, automated downloads, and library management while maintaining the integrity of existing Kiwix installations.
 
