@@ -176,9 +176,9 @@ sudo ./kiwix-update.sh smart-update -b -y -m:5M
 
 ```
 /var/local/zims/
-├── [content].zim                 # ZIM content files
-├── temp/                         # Download staging area
-├── backups/                      # Library configuration backups
+├── [content].zim                # ZIM content files
+├── temp/                        # Download staging area
+├── backups/                     # Library configuration backups
 ├── kiwix_update.log             # Operation log
 ├── .kiwix_update_status         # Process status
 └── .kiwix_library_cache         # Cached catalog data
