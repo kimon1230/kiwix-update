@@ -24,7 +24,7 @@ The script requires root privileges for system file management and service contr
 
 Download and prepare the script:
 ```bash
-wget https://raw.githubusercontent.com/yourusername/kiwix-update/main/kiwix-update.sh
+wget https://raw.githubusercontent.com/kimon1230/kiwix-update/main/kiwix-update.sh
 chmod +x kiwix-update.sh
 ```
 
