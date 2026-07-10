@@ -320,8 +320,17 @@ fetch_library_data() {
 find_latest_zim() {
     local local_filename="$1"
     local base_name="${local_filename%.zim}"
+    # Kiwix names its files with a trailing _YYYY-MM version date. Strip it so the
+    # undated title stem can match the catalog's (newer-)dated entries via the
+    # dated-version branch below. Without this, a dated local file only matched a
+    # catalog entry of the *same* date — i.e. only when no update existed (issue #1).
+    # Undated local names (no trailing _YYYY-MM) are a no-op here. Only _YYYY-MM is
+    # in scope (Kiwix's canonical form); _YYYY-MM-DD / year-only forms are not handled.
+    if [[ "$base_name" =~ ^(.+)_[0-9]{4}-[0-9]{2}$ ]]; then
+        base_name="${BASH_REMATCH[1]}"
+    fi
     local alt_name=""
-    
+
     if [ ! -f "$LIBRARY_CACHE" ]; then
         log "ERROR" "Library cache not found"
         return 1
@@ -345,6 +354,15 @@ find_latest_zim() {
             ;;
     esac
     
+    # Dot-safe stems: a literal '.' in a title (e.g. nhs.uk, superuser.com) must
+    # match '.', not any char, when interpolated into the =~ patterns below. '.' is
+    # the only ERE metacharacter that occurs in Kiwix names ([A-Za-z0-9._-]), so a
+    # dot-only escape is complete for this domain. alt_re/nopic_re come from the
+    # hardcoded rename table and never contain a dot — their escape is uniform for
+    # safety but currently unreachable.
+    local base_re="${base_name//./\\.}"
+    local alt_re="${alt_name//./\\.}"
+
     # Search for matching entry in library
     local result=""
     local best_match=""
@@ -360,7 +378,7 @@ find_latest_zim() {
         fi
         
         # Alternative name match
-        if [ -n "${alt_name}" ] && [[ "$file_base" =~ ^${alt_name}(_[0-9]{4}-[0-9]{2})?$ ]]; then
+        if [ -n "${alt_name}" ] && [[ "$file_base" =~ ^${alt_re}(_[0-9]{4}-[0-9]{2})?$ ]]; then
             if [[ "$file_base" =~ _[0-9]{4}-[0-9]{2}$ ]]; then
                 local date_part="${file_base##*_}"
                 if [ -z "$best_date" ] || [[ "$date_part" > "$best_date" ]]; then
@@ -374,7 +392,7 @@ find_latest_zim() {
         fi
         
         # Dated version match
-        if [[ "$file_base" =~ ^${base_name}_[0-9]{4}-[0-9]{2}$ ]]; then
+        if [[ "$file_base" =~ ^${base_re}_[0-9]{4}-[0-9]{2}$ ]]; then
             local date_part="${file_base##*_}"
             if [ -z "$best_date" ] || [[ "$date_part" > "$best_date" ]]; then
                 best_date="$date_part"
@@ -392,9 +410,10 @@ find_latest_zim() {
         # Try nopic version for wiktionary
         if [[ "$base_name" =~ ^wiktionary_.*_all(_maxi)?$ ]]; then
             local nopic_name="${base_name%_maxi}_nopic"
+            local nopic_re="${nopic_name//./\\.}"
             while IFS='|' read -r publisher filename path size; do
                 local file_base="${filename%.zim}"
-                if [[ "$file_base" =~ ^${nopic_name}(_[0-9]{4}-[0-9]{2})?$ ]]; then
+                if [[ "$file_base" =~ ^${nopic_re}(_[0-9]{4}-[0-9]{2})?$ ]]; then
                     result="${publisher}|${filename}|${path}|${size}"
                     break
                 fi

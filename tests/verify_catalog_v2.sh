@@ -316,6 +316,115 @@ rc=$?
 { [ "$rc" -eq 2 ] && ! grep -qi 'numfmt' <<<"$out"; } && pass "C7 numfmt guard: empty strict-path size => clean decline (rc=2, no numfmt error)" || fail "C7 numfmt guard: rc=$rc out='$out'"
 
 # ======================================================================
+echo; echo "########## Issue #1 — dated-local-file matching ##########"
+# Local Kiwix files carry a trailing _YYYY-MM date; pre-fix find_latest_zim kept
+# that date in base_name so a dated file only matched a *same-date* catalog entry
+# (i.e. never when an update existed) -> "SKIPPED / No match". Every case rewrites
+# $LIBRARY_CACHE from scratch (hermetic — C1–C7 leave it populated).
+# The unit cases call find_latest_zim directly; the i1_e2e pair asserts the same
+# behavior through analyze_updates and is the durable layer if matching later moves
+# into analyze_updates (backlog Batch 3) — port the unit cases to i1_e2e then.
+DEBUG=false
+
+fl_expect(){ # $1=local filename  $2=expected catalog field-2  $3=label  $4..=cache records
+    local lf="$1" exp="$2" label="$3"; shift 3
+    printf '%s\n' "$@" > "$LIBRARY_CACHE"
+    local out rc got; out=$(find_latest_zim "$lf"); rc=$?
+    got=$(printf '%s' "$out" | cut -d'|' -f2)
+    { [ "$rc" -eq 0 ] && [ "$got" = "$exp" ]; } && pass "$label" || fail "$label (rc=$rc got='$got' exp='$exp')"
+}
+fl_nomatch(){ # $1=local filename  $2=label  $3..=cache records
+    local lf="$1" label="$2"; shift 2
+    printf '%s\n' "$@" > "$LIBRARY_CACHE"
+    local out rc; out=$(find_latest_zim "$lf"); rc=$?
+    [ "$rc" -ne 0 ] && pass "$label" || fail "$label (unexpected match rc=$rc out='$out')"
+}
+
+# --- Group 1: bug-reproducing (rc!=0 or wrong entry pre-fix) -----------------
+# 1. dated local, only NEWER catalog entry present -> the reported SKIP; must resolve to newer.
+fl_expect "wikiquote_en_all_maxi_2025-08.zim" "wikiquote_en_all_maxi_2025-09.zim" \
+  "Issue#1.1 dated local resolves to newer catalog entry (was SKIPPED)" \
+  "pub|wikiquote_en_all_maxi_2025-09.zim|https://lb.download.kiwix.org/zim/w/wikiquote_en_all_maxi_2025-09.zim|9"
+# 2. best_date: highest wins regardless of cache order.
+fl_expect "wikivoyage_en_all_maxi_2025-05.zim" "wikivoyage_en_all_maxi_2025-09.zim" \
+  "Issue#1.2 best_date picks highest (non-monotonic seed order)" \
+  "pub|wikivoyage_en_all_maxi_2025-06.zim|u|1" \
+  "pub|wikivoyage_en_all_maxi_2025-09.zim|u|1" \
+  "pub|wikivoyage_en_all_maxi_2025-07.zim|u|1"
+# 2b. best_date tie-break: on equal max date the first-seen record wins (locks the
+#     strict '>' comparison — a switch to '>=' would flip this). Two entries share
+#     the max date and filename, distinguished only by field-3 (path).
+printf '%s\n' \
+  "pub|dup_en_all_2025-09.zim|urlFIRST|1" \
+  "pub|dup_en_all_2025-09.zim|urlSECOND|1" > "$LIBRARY_CACHE"
+got=$(find_latest_zim "dup_en_all_2025-05.zim" | cut -d'|' -f3)
+[ "$got" = "urlFIRST" ] && pass "Issue#1.2b best_date tie-break: first-seen wins on equal date" \
+  || fail "Issue#1.2b tie-break got='$got' exp='urlFIRST'"
+# 3. dotted-domain literal dot: a strictly-NEWER decoy must lose to the real entry (validates Edit B;
+#    without dot-escaping the decoy matches via '.'-wildcard and wins best_date).
+fl_expect "superuser.com_en_all_2025-08.zim" "superuser.com_en_all_2025-09.zim" \
+  "Issue#1.3 dotted '.' matched literally; newer wildcard-decoy rejected (Edit B)" \
+  "pub|superuser.com_en_all_2025-09.zim|u|1" \
+  "pub|superuserXcom_en_all_2025-10.zim|u|1"
+fl_expect "nhs.uk_en_medicines_2025-06.zim" "nhs.uk_en_medicines_2025-07.zim" \
+  "Issue#1.3b dotted nhs.uk literal-dot match; newer decoy rejected" \
+  "pub|nhs.uk_en_medicines_2025-07.zim|u|1" \
+  "pub|nhsXuk_en_medicines_2025-10.zim|u|1"
+# 4. special-case rename table now fires for dated locals (two structurally different arms).
+fl_expect "teded_en_all_2025-06.zim" "ted_mul_ted-ed_2025-07.zim" \
+  "Issue#1.4a rename teded_en_all->ted_mul_ted-ed (dated)" \
+  "pub|ted_mul_ted-ed_2025-07.zim|u|1"
+fl_expect "wikihow_en_maxi_2025-06.zim" "wikihow_en_all_2025-07.zim" \
+  "Issue#1.4b rename wikihow_en_maxi->wikihow_en_all (dated)" \
+  "pub|wikihow_en_all_2025-07.zim|u|1"
+# 5. wiktionary maxi->nopic fallback now reachable for dated locals.
+fl_expect "wiktionary_en_all_maxi_2025-06.zim" "wiktionary_en_all_nopic_2025-07.zim" \
+  "Issue#1.5 wiktionary maxi->nopic fallback (dated)" \
+  "pub|wiktionary_en_all_nopic_2025-07.zim|u|1"
+# 6. exact-match precedence: an undated catalog entry wins the exact-match break over a
+#    newer dated one. SYNTHETIC — the real OPDS-v2 catalog always derives filenames from
+#    the dated acquisition href, so an undated entry never coexists with a dated one; this
+#    only locks the tie-break, it is NOT asserting a desired "prefer undated over newer"
+#    update policy. (Post-fix behavior: pre-fix returns rc!=0, so this is not a Group-3 guard.)
+fl_expect "foo_en_all_2025-08.zim" "foo_en_all.zim" \
+  "Issue#1.6 undated exact-match entry wins over newer dated (synthetic tie-break lock)" \
+  "pub|foo_en_all.zim|u|1" \
+  "pub|foo_en_all_2025-09.zim|u|1"
+
+# --- Group 2: end-to-end through analyze_updates (the user-visible SKIP) -----
+UPDATE_CRITERIA=all; BACKGROUND=false
+i1_e2e(){ # $1=on-disk name  $2=catalog filename (newer)  $3=label
+    local disk="$1" cat="$2" label="$3"
+    rm -f "$WORK_DIR"/*.zim 2>/dev/null
+    mkzim "$WORK_DIR/$disk"
+    # printf's truncating redirect sets the cache mtime to now -> fresh, so
+    # fetch_library_data reuses the seeded cache instead of hitting the network.
+    printf 'pub|%s|https://lb.download.kiwix.org/zim/x/%s|100\n' "$cat" "$cat" > "$LIBRARY_CACHE"
+    FILES_TO_UPDATE=()
+    analyze_updates >/dev/null 2>&1
+    printf '%s\n' "${FILES_TO_UPDATE[@]}" | grep -qF "$cat" \
+      && pass "$label" || fail "$label (dated file not in FILES_TO_UPDATE — reported SKIPPED)"
+}
+i1_e2e "wikiquote_en_all_maxi_2025-08.zim" "wikiquote_en_all_maxi_2025-09.zim" \
+  "Issue#1.7 dated local drives update via analyze_updates (was SKIPPED / No match)"
+i1_e2e "superuser.com_en_all_2025-08.zim" "superuser.com_en_all_2025-09.zim" \
+  "Issue#1.7b dotted-domain dated local drives update end-to-end (Edit B via public path)"
+
+# --- Group 3: guards (green BOTH before and after the fix) -------------------
+fl_expect "pintest.zim" "pintest_2026-01.zim" \
+  "Issue#1.8 undated local still matches (no regression)" \
+  "pub|pintest_2026-01.zim|u|1"
+fl_nomatch "doesnotexist_en_all_2025-08.zim" \
+  "Issue#1.9 genuine no-match returns non-zero" \
+  "pub|somethingelse_en_all_2025-09.zim|u|1"
+# 10. boundary lock: a _YYYY-MM-DD (full-date) suffix is NOT stripped (only _YYYY-MM is),
+#     so the stem stays intact and matches its own exact catalog entry. Guards the
+#     documented strip scope against a future broadening of the strip regex.
+fl_expect "foo_en_all_2025-08-15.zim" "foo_en_all_2025-08-15.zim" \
+  "Issue#1.10 _YYYY-MM-DD suffix left unstripped (strip-scope boundary)" \
+  "pub|foo_en_all_2025-08-15.zim|u|1"
+
+# ======================================================================
 if [ "${KIWIX_LIVE:-0}" = 1 ]; then
   echo; echo "########## LIVE smoke (KIWIX_LIVE=1) ##########"
   T=/tmp/catv2_live.xml
