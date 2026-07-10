@@ -1,0 +1,29 @@
+name: shellcheck
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+# Least privilege: this job only reads the repo (CWE-732 hardening).
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a full commit SHA (not the mutable @v4 tag) to prevent tag
+      # hijack from running attacker code in CI. Verify/refresh via Dependabot.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install shellcheck (pinned version)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Syntax check
+        run: bash -n kiwix-update.sh
+      # Gate the build at WARNING level so real issues (unquoted expansions,
+      # word-splitting, unused vars) fail CI. SC2155 (declare-and-assign) is a
+      # deliberate, pervasive style choice in this script and is excluded.
+      - name: ShellCheck (warnings gate the build)
+        run: shellcheck --severity=warning --exclude=SC2155 kiwix-update.sh

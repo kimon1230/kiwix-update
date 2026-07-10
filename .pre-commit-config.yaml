@@ -1,0 +1,11 @@
+# Run `pre-commit install` once to enable. Blocks secrets from being committed.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.10.0
+    hooks:
+      - id: shellcheck
+        args: ["--severity=warning", "--exclude=SC2155"]

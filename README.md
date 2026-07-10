@@ -8,7 +8,7 @@ The script provides intelligent update detection, automated downloads, and libra
 
 The script interfaces with the Kiwix library catalog to identify available updates, compares them against local collections, and selectively downloads newer versions. It handles the complexities of ZIM file versioning and naming conventions that have evolved over time, ensuring compatibility across different content types and publishers.
 
-Key capabilities include differential update detection, robust download management with resume support, and automated library synchronization.
+Key capabilities include differential update detection, robust download management with resumable downloads, and automated library synchronization.
 
 ## Dependencies
 
@@ -32,6 +32,13 @@ Default file locations (configurable by editing script variables):
 - ZIM files: `/var/local/zims/`
 - Library XML: `/var/local/library_zim.xml`
 - Working directories: `/var/local/zims/{temp,backups}/`
+
+**Permissions prerequisite (security):** the working directory and every parent
+must be owned by root and not group/other-writable. On stock Debian `/var/local`
+is `2775 root:staff` (group-writable), so the script will refuse to run until you
+either tighten it (`sudo chmod g-w /var/local`) or point `WORK_DIR` at a
+root-owned path such as `/var/lib/kiwix`. This prevents a non-root user from
+pre-planting directories or symlinks that root would otherwise act on.
 
 ## Usage
 
@@ -62,7 +69,8 @@ sudo ./kiwix-update.sh status
 -p:[NUM]             Parallel connections (1-50)
 -m:[SPEED]           Bandwidth limit (e.g., -m:5M)
 -u:[CRITERIA]        Update criteria (size|newer|all)
--s:[LETTER]          Filter by filename prefix
+--allow-unverified   Permit installs when no SHA-256 metalink is available
+                     (default: OFF — a missing hash blocks the download)
 ```
 
 ### Update Criteria
@@ -84,9 +92,6 @@ sudo ./kiwix-update.sh smart-update -b -y
 
 # Bandwidth-limited updates
 sudo ./kiwix-update.sh smart-update -m:2M -p:3
-
-# Subject-specific updates (e.g., Wikipedia collections)
-sudo ./kiwix-update.sh smart-update -s:w
 ```
 
 ## Implementation Details
@@ -113,7 +118,7 @@ During updates, the script:
 
 ### Download Management
 
-Uses aria2c for multi-connection downloads with automatic retry logic. Downloads are verified against remote checksums before replacing existing files. Temporary files are isolated to prevent corruption of active collections.
+Uses aria2c for multi-connection downloads with automatic retry logic. Each download is verified against the **SHA-256 hash published in the Kiwix `.meta4` metalink** before it replaces an existing file; a mismatch (or, by default, a missing hash) blocks the install. Downloads are served over HTTPS only, and the `.meta4` is fetched from the canonical origin so the hash is authoritative even when the bytes come from a mirror. Temporary files are isolated to prevent corruption of active collections.
 
 ## Monitoring and Logging
 
@@ -188,9 +193,9 @@ sudo ./kiwix-update.sh smart-update -b -y -m:5M
 
 - Requires bash 4.0+ with standard POSIX utilities
 - Tested on Debian/Ubuntu systems (Raspberry Pi OS, Ubuntu Server)
-- Library XML parsing uses grep/awk for compatibility
-- Download verification through HTTP header analysis
-- Atomic file operations prevent corruption during updates
+- Library and catalog parsing use bash regex, grep, and awk for compatibility
+- Download integrity verified via SHA-256 from the Kiwix metalink (HTTPS-only transport)
+- Atomic (intra-filesystem) rename on install prevents corruption during updates
 
 ## License
 

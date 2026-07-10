@@ -1,0 +1,41 @@
+# Secrets / credentials (never commit)
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.p8
+*.crt
+id_rsa*
+id_ed25519*
+.netrc
+credentials*.json
+service-account*.json
+
+# Local tooling / editor / OS artifacts
+.claude/
+.cursor/
+.aider*
+CLAUDE.local.md
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+._*
+
+# Runtime / state (this tool writes these under WORK_DIR, but guard against
+# accidental commits if someone points WORK_DIR at the repo)
+*.zim
+*.part
+kiwix_update.log*
+.kiwix_update*
+.heartbeat
+.library_zim_temp.*
