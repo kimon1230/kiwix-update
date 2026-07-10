@@ -14,8 +14,7 @@ STATUS_FILE="${WORK_DIR}/.kiwix_update_status"
 PID_FILE="${WORK_DIR}/.kiwix_update.pid" 
 CRITERIA_FILE="${WORK_DIR}/.kiwix_update_criteria"
 LIBRARY_CACHE="${WORK_DIR}/.kiwix_library_cache"
-KIWIX_LIBRARY_API="https://library.kiwix.org/catalog/root.xml"
-KIWIX_DOWNLOAD_BASE="https://download.kiwix.org"
+KIWIX_LIBRARY_API="https://library.kiwix.org/catalog/v2/entries?count=-1"
 
 # Default values
 YES_TO_ALL=false
@@ -31,6 +30,11 @@ DEBUG=false
 # Integrity opt-out (default OFF = fail-closed). Only set via --allow-unverified
 # for operators knowingly using a size-only / non-Kiwix mirror with no metalink.
 ALLOW_UNVERIFIED=false
+# Force HTTPS-only for the bulk .zim transfer even when a SHA-256 hash is present.
+# Default OFF: the metalink hash (fetched over HTTPS from the kiwix.org anchor)
+# gates integrity, so an HTTP mirror hop on the default path is caught after
+# download. Set via --https-only for operators who want strict transport anyway.
+HTTPS_ONLY=false
 # Guard: log() must NOT append to LOG_FILE (which lives under WORK_DIR) until the
 # trusted-dir gate has confirmed WORK_DIR is not an attacker-planted symlink.
 # Otherwise a pre-gate/gate-failure log write follows the symlink and lets root
@@ -228,17 +232,21 @@ fetch_library_data() {
             /<entry>/ { in_entry=1; publisher=""; link=""; size=""; }
             /<\/entry>/ { 
                 if (link != "") {
+                    # The v2 acquisition href is already the absolute
+                    # .zim.meta4 URL (on lb.download.kiwix.org). Drop only the
+                    # .meta4 suffix so path becomes the full absolute .zim URL;
+                    # the host-pin in analyze_updates validates it before use.
                     path = link
-                    gsub(/^https:\/\/download\.kiwix\.org\//, "", path);
                     gsub(/\.meta4$/, "", path);
                     filename = path
                     gsub(/.*\//, "", filename);
-                    # Sanitize fields so a hostile catalog cannot inject the
-                    # pipe delimiter or control bytes into the record.
-                    gsub(/[|[:cntrl:]]/, "", publisher);
-                    gsub(/[|[:cntrl:]]/, "", filename);
-                    gsub(/[|[:cntrl:]]/, "", path);
-                    gsub(/[|[:cntrl:]]/, "", size);
+                    # Sanitize fields so a hostile catalog cannot inject the pipe
+                    # delimiter, control bytes, or whitespace into the record. A
+                    # URL legitimately contains ':' and '/', which are preserved.
+                    gsub(/[|[:cntrl:][:space:]]/, "", publisher);
+                    gsub(/[|[:cntrl:][:space:]]/, "", filename);
+                    gsub(/[|[:cntrl:][:space:]]/, "", path);
+                    gsub(/[|[:cntrl:][:space:]]/, "", size);
                     print publisher "|" filename "|" path "|" size
                 }
                 in_entry=0; 
@@ -251,7 +259,9 @@ fetch_library_data() {
                     publisher=$0;
                 }
             }
-            in_entry && /rel="http:\/\/opds-spec.org\/acquisition\/open-access"/ {
+            in_entry && link=="" && /rel="http:\/\/opds-spec.org\/acquisition\/open-access"/ {
+                # First open-access acquisition link wins (deterministic if a
+                # future entry ever groups multiple flavours in one <entry>).
                 match($0, /href="[^"]+"/);
                 link=substr($0, RSTART+6, RLENGTH-7);
                 match($0, /length="[^"]+"/);
@@ -261,6 +271,13 @@ fetch_library_data() {
             }
         ' "${LIBRARY_CACHE}.tmp" > "$LIBRARY_CACHE"
         
+        # Capture the feed's advertised total before removing the raw response.
+        # The tag is un-namespaced <totalResults> on the live feed; tolerate an
+        # opensearch: prefix defensively.
+        local total_results
+        total_results=$(grep -oiE '<(opensearch:)?totalResults>[0-9]+' "${LIBRARY_CACHE}.tmp" \
+            | grep -oE '[0-9]+' | head -n1)
+
         rm -f "${LIBRARY_CACHE}.tmp"
 
         # awk emits exactly one line per entry, so 0 lines means the feed format changed
@@ -268,6 +285,27 @@ fetch_library_data() {
         entry_count=$(wc -l < "$LIBRARY_CACHE")
         if [ "$entry_count" -eq 0 ]; then
             log "ERROR" "Catalog parse produced 0 entries — feed format may have changed"
+            rm -f "$LIBRARY_CACHE"
+            return 1
+        fi
+
+        # Truncation guard: validate <totalResults> is a positive integer and
+        # cross-check it against the parsed count. A future silent cap on
+        # count=-1 would return >0 but far-fewer entries, and without this the
+        # zero-entry guard would not trip — nearly every local file would be
+        # silently marked "no match". Fail loud (fail-closed) rather than drop
+        # updates or let an empty operand disable the check.
+        # Bound the digit count too: a hostile feed could otherwise supply a
+        # 20+-digit value that overflows the 64-bit `* 99` arithmetic below and
+        # silently disables the truncation cross-check. 9 digits (<1e9) is far
+        # above any real catalog (~3602) yet safe from overflow.
+        if ! [[ "$total_results" =~ ^[0-9]+$ ]] || [ "${#total_results}" -gt 9 ] || [ "$total_results" -le 0 ]; then
+            log "ERROR" "Catalog <totalResults> missing or unparseable — feed format may have changed"
+            rm -f "$LIBRARY_CACHE"
+            return 1
+        fi
+        if [ $(( entry_count * 100 )) -lt $(( total_results * 99 )) ]; then
+            log "ERROR" "Catalog truncated: parsed ${entry_count} of ${total_results} entries — Kiwix may have capped count=-1 (pagination needed)"
             rm -f "$LIBRARY_CACHE"
             return 1
         fi
@@ -433,6 +471,9 @@ Options:
    -u:[size|newer|all]  Update criteria
    --allow-unverified   Permit installs when no SHA-256 metalink is available
                         (default: OFF — a missing hash blocks the download)
+   --https-only         Force HTTPS-only for the .zim download even when a
+                        SHA-256 hash is present (default: OFF — an HTTP mirror
+                        hop is permitted and verified by the hash)
 
 Examples:
    $(basename "$0") check-updates
@@ -581,21 +622,43 @@ manage_kiwix_service() {
     esac
 }
 
+# True when the bulk .zim transfer must stay HTTPS-only: either the operator
+# forced it (--https-only) or there is no integrity hash to fall back on
+# (--allow-unverified drops the SHA-256 gate, so transport is the only control).
+# The transport decision is a function of these flags, NOT of per-file hash
+# presence — the metalink hash is only fetched post-download, so hash presence
+# is unknowable at resolve time. With ALLOW_UNVERIFIED=false (default) the hash
+# is mandatory and fail-closed, so a tampered HTTP-mirror file is caught anyway.
+_download_strict() {
+    ${HTTPS_ONLY} || ${ALLOW_UNVERIFIED}
+}
+
 get_remote_size() {
     local url="$1"
     local size
-    
+    # The .zim GET on the LB 302-redirects to a (possibly HTTP) mirror, so the
+    # HEAD must follow the redirect (-L, bounded) to return a real size — else
+    # the disk-fill ceiling and disk-space guards silently see "0 bytes". Scheme
+    # policy mirrors the download: strict paths pin https and refuse an HTTP
+    # mirror (correct fail-closed); the default path allows an HTTP mirror hop.
+    local proto='=https'
+    _download_strict || proto='=http,https'
+
     if [ -z "$url" ]; then
         return 1
     fi
-    
-    if size=$(curl -sI --proto '=https' --proto-redir '=https' --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" --fail -- "$url" | grep -i content-length | tail -n1 | awk '{print $2}' | tr -d '\r'); then
+
+    # --max-redirs 1: the only legitimate hop is the LB (kiwix.org, TLS) -> mirror.
+    # Allowing a 2nd hop would let a (possibly HTTP) mirror redirect this root HEAD
+    # at an internal/link-local/metadata host (SSRF); one hop can only be steered
+    # by the TLS-authenticated kiwix.org LB.
+    if size=$(curl -sLI --proto "$proto" --proto-redir "$proto" --max-redirs 1 --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" --fail -- "$url" | grep -i content-length | tail -n1 | awk '{print $2}' | tr -d '\r'); then
         if [[ "$size" =~ ^[0-9]+$ ]]; then
             echo "$size"
             return 0
         fi
     fi
-    
+
     return 1
 }
 
@@ -621,6 +684,11 @@ fetch_metalink_sha256() {
     # No --fail: it collapses 404 and transient 5xx into one exit code. Capture
     # the HTTP status so retry (network/5xx) is distinguishable from block (4xx).
     # --proto pins https; --max-filesize bounds a hostile/oversized .meta4.
+    # DELIBERATELY NO -L: the integrity anchor must come 200-direct from the
+    # host analyze_updates already pinned to *.kiwix.org. Following a redirect
+    # (even HTTPS-pinned) would let an off-kiwix host — reachable via an
+    # open-redirect on any kiwix.org endpoint — supply the SHA-256, defeating the
+    # sole integrity control. A redirected .meta4 therefore fails closed (rc 3).
     if ! code=$(curl -sS --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" \
         --proto '=https' --proto-redir '=https' --max-filesize 5242880 \
         -o "$meta4_tmp" -w '%{http_code}' -- "$meta4_url"); then
@@ -736,6 +804,22 @@ backup_library_xml() {
     return 0
 }
 
+# Run aria2c under a hard file-size cap (ulimit -f, in 1024-byte blocks) so a
+# hostile/MITM mirror cannot stream unbounded bytes to root's disk before the
+# post-download hash runs (the HEAD-based ceiling is spoofable). Exceeding the
+# cap raises SIGXFSZ, which kills aria2c (non-zero exit) and truncates the
+# .part; the retry loop then fails cleanly. cap<=0 means "uncapped".
+# $1 = cap in KiB; remaining args = aria2c argv.
+_aria2c_capped() {
+    local cap="$1"; shift
+    if [ "$cap" -gt 0 ]; then
+        # Fail closed: if the rlimit cannot be set, do NOT run aria2c uncapped.
+        ( ulimit -f "$cap" 2>/dev/null || exit 1; aria2c "$@" )
+    else
+        aria2c "$@"
+    fi
+}
+
 download_file() {
     local url="$1"
     local output="$2"
@@ -758,26 +842,59 @@ download_file() {
     
     # Confirm download if not auto-yes
     if ! ${YES_TO_ALL}; then
-        local size=$(get_remote_size "$url")
+        # Guard the size BY VALUE, not by exit status: `local size=$(...)` always
+        # returns 0 (local masks the command-substitution exit, SC2155), so a
+        # strict-path empty size would still reach numfmt and error. On the
+        # strict path an HTTP-only mirror correctly yields no size.
+        local size
+        size=$(get_remote_size "$url")
+        [[ "$size" =~ ^[0-9]+$ ]] || size=0
         read -p "Download $filename ($(numfmt --to=iec-i --suffix=B "$size"))? [y/N] " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             log "INFO" "Skipping $filename"
-            return 0
+            # return 2 = user-declined skip (NOT a failure). The caller treats 2
+            # as a clean 'continue'; a return 0 here would be read as success and
+            # trigger the destructive rm -f/library-transition on a file that was
+            # never downloaded.
+            return 2
         fi
     fi
     
-    # Get final URL after redirects. --proto/--proto-redir pin the whole chain to
-    # https so a mirror cannot downgrade the resolution to http:// or a non-http
-    # scheme (file://, etc.).
-    local final_url
-    final_url=$(curl -sLI --proto '=https' --proto-redir '=https' \
-        -o /dev/null -w '%{url_effective}' -- "$url") || final_url="$url"
+    # Resolve the final URL after redirects. Constrain the resolve AT THE CURL
+    # LAYER: non-http(s) schemes (file://, gopher://, ...) are refused during
+    # resolution — before any post-hoc regex — and the redirect budget is capped
+    # at ONE hop (--max-redirs 1): the only legitimate hop is the LB (kiwix.org,
+    # TLS) -> mirror. Allowing a 2nd hop would let a (possibly HTTP) mirror
+    # redirect this root request at an internal/metadata host (SSRF); a single
+    # hop can only be steered by the TLS-authenticated kiwix.org LB. On the
+    # default (hash-gated) path an HTTP mirror hop is allowed; strict paths pin
+    # https.
+    local resolve_proto='=http,https'
+    _download_strict && resolve_proto='=https'
 
-    # Re-validate after redirect resolution — a mirror redirect must not
-    # downgrade us to http:// (M1/A4).
-    if [[ ! "$final_url" =~ ^https:// ]]; then
-        log "ERROR" "Refusing non-HTTPS redirect target: $final_url"
+    local final_url
+    if ! final_url=$(curl -sLI --proto "$resolve_proto" --proto-redir "$resolve_proto" \
+        --max-redirs 1 -o /dev/null -w '%{url_effective}' -- "$url") || [ -z "$final_url" ]; then
+        # Do NOT fall back to the un-resolved LB URL: the LB always 302s the
+        # .zim, so handing it to aria2c would either fail confusingly or (with a
+        # nonzero --max-redirect) re-open the uncontrolled-redirect hole. The
+        # hash still gates integrity, but transport safety comes from resolving
+        # here — so a resolve failure is a genuine failure: WARN + return 1.
+        log "ERROR" "Failed to resolve download URL for $filename — skipping"
+        return 1
+    fi
+
+    # Validate the resolved scheme. https is always fine; http only on the
+    # default (hash-gated) path; anything else is refused (anchored so
+    # 'httpfoo://' can't slip through).
+    if _download_strict; then
+        if [[ ! "$final_url" =~ ^https:// ]]; then
+            log "ERROR" "Refusing non-HTTPS redirect target under strict transport: $final_url"
+            return 1
+        fi
+    elif [[ ! "$final_url" =~ ^https?:// ]]; then
+        log "ERROR" "Refusing non-HTTP(S) redirect target: $final_url"
         return 1
     fi
 
@@ -810,9 +927,11 @@ download_file() {
         --connect-timeout=60
         --remote-time=true
         --console-log-level=error
-        # Do NOT follow further redirects: the URL is already the https-pinned,
-        # curl-resolved terminal URL, so any additional redirect from a mirror
-        # would be an uncontrolled http-downgrade / SSRF hop from root (M3).
+        # The URL is already the curl-resolved terminal mirror URL (which serves
+        # the file 200-direct), so aria2c needs NO redirects. --max-redirect=0 on
+        # every path: a redirect here could only come from a mirror re-redirect,
+        # which is exactly the attacker-injectable SSRF hop we refuse. aria2c has
+        # no --proto, so 0 also forecloses an ftp:// redirect leg.
         --max-redirect=0
     )
     
@@ -826,9 +945,34 @@ download_file() {
         aria_opts+=(--quiet=true --show-console-readout=false)
     fi
 
+    # Compute the hard download byte cap (KiB) for _aria2c_capped. Prefer the
+    # authoritative catalog ceiling (expected + 1% + 4K); if the catalog size is
+    # unknown, bound by free space minus a 512 MiB margin so an unbounded hostile
+    # stream still can't fully exhaust the disk. cap=0 => leave uncapped (already
+    # low on space, where check_disk_space governs, or free space unreadable).
+    local fcap_kib=0
+    if [[ "$expected_bytes" =~ ^[0-9]+$ ]] && [ "$expected_bytes" -gt 0 ]; then
+        fcap_kib=$(( (expected_bytes + expected_bytes / 100 + 4096) / 1024 + 1 ))
+    else
+        # Unknown catalog size: bound by free space, reserving a margin (the
+        # smaller of 512 MiB or 10% of free) so a hostile unbounded stream can
+        # never drive the disk to 0 — even when free space is already low.
+        local free_kib reserve_kib
+        free_kib=$(( $(get_free_space) / 1024 ))
+        if [ "$free_kib" -gt 0 ]; then
+            reserve_kib=$(( 512 * 1024 ))
+            [ "$reserve_kib" -gt $(( free_kib / 10 )) ] && reserve_kib=$(( free_kib / 10 ))
+            fcap_kib=$(( free_kib - reserve_kib ))
+        fi
+        # df unreadable (free_kib=0) or the subtraction non-positive: fall back to
+        # a large absolute ceiling that exceeds any real .zim (~110 GiB max) yet
+        # still bounds a truly-infinite hostile stream, rather than uncapped.
+        [ "$fcap_kib" -le 0 ] && fcap_kib=$(( 256 * 1024 * 1024 ))
+    fi
+
     local retry_count=0
     local success=false
-    
+
     while [ $retry_count -lt $MAX_RETRIES ] && [ "$success" = false ]; do
         retry_count=$((retry_count + 1))
         
@@ -837,12 +981,13 @@ download_file() {
             sleep 5
         fi
         
-        # download_file is always called via `if ! download_file ...`, which
-        # suspends set -e/pipefail in this body, so a failed aria2c pipeline
-        # falls through to the retry logic below instead of aborting the script.
+        # download_file is called via `if download_file ...; then dl_rc=0; else
+        # dl_rc=$?; fi`, whose `if` condition suspends set -e/pipefail in this
+        # body, so a failed aria2c pipeline falls through to the retry logic
+        # below instead of aborting the script.
         local aria_rc
         if ! ${QUIET}; then
-            aria2c "${aria_opts[@]}" -- "$final_url" 2>&1 | \
+            _aria2c_capped "$fcap_kib" "${aria_opts[@]}" -- "$final_url" 2>&1 | \
                 awk -v filename="$filename" '
                 /\[#.*\]/ {
                     match($0, /([0-9]+)%/)
@@ -858,7 +1003,7 @@ download_file() {
             aria_rc=${PIPESTATUS[0]}
             echo
         else
-            aria2c "${aria_opts[@]}" -- "$final_url" > /dev/null 2>&1
+            _aria2c_capped "$fcap_kib" "${aria_opts[@]}" -- "$final_url" > /dev/null 2>&1
             aria_rc=$?
         fi
 
@@ -1000,16 +1145,28 @@ analyze_updates() {
             log "WARN" "No catalog size for ${filename} — using date-only comparison"
         fi
 
-        latest_path="${latest_path#/}"
-        # Validate the catalog-derived path before it builds a root-run download
-        # URL: allow only safe URL-path characters and reject any '..' traversal
-        # segment (host is pinned to KIWIX_DOWNLOAD_BASE, but don't let a hostile
-        # catalog steer the path within the origin).
-        if [[ ! "$latest_path" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$latest_path" == *..* ]]; then
-            log "WARN" "Skipping ${filename}: unsafe catalog path '${latest_path}'"
+        # latest_path now holds the absolute acquisition URL from the v2 feed.
+        local latest_url="$latest_path"
+        # Host-pin (supersedes the old relative-path allowlist): the feed hands
+        # us an absolute URL on the kiwix.org domain (the LB). Require a literal
+        # lowercase https:// scheme (consistent with the downstream
+        # case-sensitive checks in download_file / fetch_metalink_sha256), pin
+        # the host to *.kiwix.org, and reject any '..' traversal or
+        # whitespace/control char. A hostile catalog cannot steer the download
+        # or the metalink anchor off-domain. NB: this pins the URL the FEED hands
+        # us (the LB/metalink), not the eventual rotating mirror (see C5).
+        local _url_host=""
+        if [[ "$latest_url" =~ ^https://([^/]+)(/|$) ]]; then
+            _url_host="${BASH_REMATCH[1],,}"   # lowercase the host only
+        fi
+        if [[ ! "$latest_url" =~ ^https:// ]] \
+           || [ -z "$_url_host" ] \
+           || [[ ! "$_url_host" =~ ^([a-z0-9-]+\.)*kiwix\.org$ ]] \
+           || [[ "$latest_url" == *..* ]] \
+           || [[ "$latest_url" =~ [[:space:][:cntrl:]] ]]; then
+            log "WARN" "Skipping ${filename}: untrusted catalog URL '$(_disp "$latest_url")'"
             continue
         fi
-        local latest_url="${KIWIX_DOWNLOAD_BASE}/${latest_path}"
         local latest_name="${latest_filename%.zim}"
         
         local status="Up to date"
@@ -1252,8 +1409,24 @@ do_smart_update() {
         fi
         
         # Download (pass the authoritative catalog size for the mirror sanity
-        # check and the size-fallback comparison)
-        if ! download_file "$remote_url" "$new_filepath" "$expected_bytes"; then
+        # check and the size-fallback comparison). Capture the exit code with a
+        # set -e-robust form (NOT `local dl_rc=$(...)`), then dispatch on the
+        # three-way contract: 0=downloaded, 2=user-declined (skip cleanly),
+        # 1/other=genuine failure.
+        local dl_rc
+        if download_file "$remote_url" "$new_filepath" "$expected_bytes"; then
+            dl_rc=0
+        else
+            dl_rc=$?
+        fi
+
+        if [ "$dl_rc" -eq 2 ]; then
+            # User declined this download: preserve the old file, do not count as
+            # updated or failed, and move on (do NOT fall into the success branch
+            # below, which would rm -f the old file).
+            log "INFO" "Skipped ${filename} (declined by operator)"
+            continue
+        elif [ "$dl_rc" -ne 0 ]; then
             log "ERROR" "Failed to update ${filename}"
             total_failed=$((total_failed + 1))
             if ! $CONTINUE_ON_ERROR; then
@@ -1604,6 +1777,7 @@ main() {
     for _arg in "$@"; do
         case "$_arg" in
             --allow-unverified) ALLOW_UNVERIFIED=true ;;
+            --https-only) HTTPS_ONLY=true ;;
             *) _kept_args+=("$_arg") ;;
         esac
     done

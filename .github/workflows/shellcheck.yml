@@ -27,3 +27,10 @@ jobs:
       # deliberate, pervasive style choice in this script and is excluded.
       - name: ShellCheck (warnings gate the build)
         run: shellcheck --severity=warning --exclude=SC2155 kiwix-update.sh
+      # Functional + security regression harness: exercises the real functions
+      # with stubbed curl/aria2c/service managers (no network — the live smoke is
+      # gated behind KIWIX_LIVE, left unset here). Gates the security-critical
+      # catalog parsing, URL host-pin, transport/SSRF policy, and the
+      # do_smart_update return-code contract so a regression fails CI.
+      - name: Regression tests
+        run: bash tests/verify_catalog_v2.sh

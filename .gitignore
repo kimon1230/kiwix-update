@@ -37,5 +37,6 @@ desktop.ini
 *.part
 kiwix_update.log*
 .kiwix_update*
+.kiwix_library_cache*
 .heartbeat
 .library_zim_temp.*

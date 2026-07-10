@@ -71,6 +71,9 @@ sudo ./kiwix-update.sh status
 -u:[CRITERIA]        Update criteria (size|newer|all)
 --allow-unverified   Permit installs when no SHA-256 metalink is available
                      (default: OFF — a missing hash blocks the download)
+--https-only         Force HTTPS-only for the .zim download even when a
+                     SHA-256 hash is present (default: OFF — an HTTP mirror
+                     hop is permitted and verified by the hash)
 ```
 
 ### Update Criteria
@@ -118,7 +121,9 @@ During updates, the script:
 
 ### Download Management
 
-Uses aria2c for multi-connection downloads with automatic retry logic. Each download is verified against the **SHA-256 hash published in the Kiwix `.meta4` metalink** before it replaces an existing file; a mismatch (or, by default, a missing hash) blocks the install. Downloads are served over HTTPS only, and the `.meta4` is fetched from the canonical origin so the hash is authoritative even when the bytes come from a mirror. Temporary files are isolated to prevent corruption of active collections.
+Uses aria2c for multi-connection downloads with automatic retry logic. Each download is verified against the **SHA-256 hash published in the Kiwix `.meta4` metalink** before it replaces an existing file; a mismatch (or, by default, a missing hash) blocks the install.
+
+The catalog and metalink metadata are always fetched over **HTTPS from the `kiwix.org` domain** (the catalog uses the OPDS v2 endpoint `catalog/v2/entries`; the `.meta4` is served directly by the load balancer), so the hash is authoritative. The bulk `.zim` transfer itself is delivered via `lb.download.kiwix.org`, which redirects to a **rotating pool of mirrors** — some of which are HTTP-only. Because the SHA-256 hash is the integrity control, an HTTP mirror hop is permitted **on the default path** (a tampered mirror is caught after download). If you would rather refuse HTTP mirrors outright, pass `--https-only` (downloads may then fail on HTTP-mirror days). When `--allow-unverified` drops the hash gate, transport is automatically forced HTTPS-only regardless — without a hash, transport is the only remaining control. Temporary files are isolated to prevent corruption of active collections.
 
 ## Monitoring and Logging
 
@@ -193,8 +198,8 @@ sudo ./kiwix-update.sh smart-update -b -y -m:5M
 
 - Requires bash 4.0+ with standard POSIX utilities
 - Tested on Debian/Ubuntu systems (Raspberry Pi OS, Ubuntu Server)
-- Library and catalog parsing use bash regex, grep, and awk for compatibility
-- Download integrity verified via SHA-256 from the Kiwix metalink (HTTPS-only transport)
+- Library and catalog parsing use bash regex, grep, and awk for compatibility (OPDS v2 catalog: `catalog/v2/entries`)
+- Download integrity verified via SHA-256 from the Kiwix metalink (metadata is HTTPS-only from kiwix.org; the hash gates the bulk transfer, so rotating HTTP mirrors are permitted by default — override with `--https-only`)
 - Atomic (intra-filesystem) rename on install prevents corruption during updates
 
 ## License
