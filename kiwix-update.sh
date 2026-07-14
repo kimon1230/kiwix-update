@@ -5,8 +5,8 @@
 # on the caller's shell.
 
 # File & URL locations
-WORK_DIR="/var/local/zims" # this is where your .zim files live
-ZIM_LIBRARY="/var/local/library_zim.xml" # this points to your library_zim.xml
+WORK_DIR="${KIWIX_WORK_DIR:-/var/local/zims}" # where your .zim files live (override: KIWIX_WORK_DIR)
+ZIM_LIBRARY="${KIWIX_ZIM_LIBRARY:-/var/local/library_zim.xml}" # library_zim.xml (override: KIWIX_ZIM_LIBRARY)
 TEMP_DIR="${WORK_DIR}/temp"
 BACKUP_DIR="${WORK_DIR}/backups"
 LOG_FILE="${WORK_DIR}/kiwix_update.log"
@@ -18,6 +18,11 @@ KIWIX_LIBRARY_API="https://library.kiwix.org/catalog/v2/entries?count=-1"
 
 # Default values
 YES_TO_ALL=false
+# EXPLICIT_YES tracks whether -y was passed on its own. It is NOT implied by -b:
+# -b sets YES_TO_ALL (to suppress interactive prompts a background job can't answer)
+# but must NOT silently disarm the unprivileged kiwix-serve safety refusal. Only an
+# explicit -y overrides that refusal. See require_service_stopped_if_unprivileged.
+EXPLICIT_YES=false
 CONTINUE_ON_ERROR=false
 QUIET=false
 PARALLEL_CONNECTIONS=5
@@ -27,6 +32,10 @@ TIMEOUT=30
 MAX_RETRIES=3
 UPDATE_CRITERIA="all"
 DEBUG=false
+# Run mode (resolved by determine_run_mode from the effective uid). false = root
+# mode (today's behavior); true = unprivileged/single-user mode against a
+# user-owned WORK_DIR. Default false so any pre-resolution reference is safe.
+UNPRIVILEGED=false
 # Integrity opt-out (default OFF = fail-closed). Only set via --allow-unverified
 # for operators knowingly using a size-only / non-Kiwix mirror with no metalink.
 ALLOW_UNVERIFIED=false
@@ -201,7 +210,12 @@ update_kiwix_library() {
         return 1
     fi
     chmod 644 "${ZIM_LIBRARY}"
-    chown --no-dereference root:root "${ZIM_LIBRARY}"
+    # Only root can (and should) hand the library to root:root. In unprivileged
+    # mode the file stays owned by the running user — the trust gate already
+    # requires WORK_DIR and its ancestors to be owned by that same user or root.
+    if ! ${UNPRIVILEGED}; then
+        chown --no-dereference root:root "${ZIM_LIBRARY}"
+    fi
 
     return 0
 }
@@ -278,9 +292,23 @@ fetch_library_data() {
         total_results=$(grep -oiE '<(opensearch:)?totalResults>[0-9]+' "${LIBRARY_CACHE}.tmp" \
             | grep -oE '[0-9]+' | head -n1)
 
+        # Count the RAW <entry> elements in the feed BEFORE removing the raw
+        # response — this is the honest truncation signal. entry_count below counts
+        # only OPEN-ACCESS entries (the awk emits a line only when an open-access
+        # acquisition link is present), so a complete feed with some non-open entries
+        # has entry_count < total_results and would falsely trip the guard. One
+        # <entry> per line is the feed shape the awk already relies on (open/close
+        # tags on separate lines), so grep -c is exact here. `|| true`: grep -c exits
+        # 1 on zero matches, which would abort under set -e (masked today only by the
+        # sole `if ! fetch_library_data` caller); raw_entries=0 then feeds the
+        # zero-parsed guard below rather than trapping.
+        local raw_entries
+        raw_entries=$(grep -c '<entry>' "${LIBRARY_CACHE}.tmp" || true)
+
         rm -f "${LIBRARY_CACHE}.tmp"
 
-        # awk emits exactly one line per entry, so 0 lines means the feed format changed
+        # The awk emits one line per OPEN-ACCESS entry, so 0 lines means the parser
+        # broke (feed format changed) — checked independently of the truncation guard.
         local entry_count
         entry_count=$(wc -l < "$LIBRARY_CACHE")
         if [ "$entry_count" -eq 0 ]; then
@@ -290,11 +318,12 @@ fetch_library_data() {
         fi
 
         # Truncation guard: validate <totalResults> is a positive integer and
-        # cross-check it against the parsed count. A future silent cap on
-        # count=-1 would return >0 but far-fewer entries, and without this the
-        # zero-entry guard would not trip — nearly every local file would be
-        # silently marked "no match". Fail loud (fail-closed) rather than drop
-        # updates or let an empty operand disable the check.
+        # cross-check it against the RAW <entry> count in the feed (raw_entries),
+        # NOT the open-access-only parsed count. A future silent cap on count=-1
+        # would return >0 but far-fewer entries, and without this the zero-entry
+        # guard would not trip — nearly every local file would be silently marked
+        # "no match". Fail loud (fail-closed) rather than drop updates or let an
+        # empty operand disable the check.
         # Bound the digit count too: a hostile feed could otherwise supply a
         # 20+-digit value that overflows the 64-bit `* 99` arithmetic below and
         # silently disables the truncation cross-check. 9 digits (<1e9) is far
@@ -304,8 +333,8 @@ fetch_library_data() {
             rm -f "$LIBRARY_CACHE"
             return 1
         fi
-        if [ $(( entry_count * 100 )) -lt $(( total_results * 99 )) ]; then
-            log "ERROR" "Catalog truncated: parsed ${entry_count} of ${total_results} entries — Kiwix may have capped count=-1 (pagination needed)"
+        if [ $(( raw_entries * 100 )) -lt $(( total_results * 99 )) ]; then
+            log "ERROR" "Catalog truncated: feed carried ${raw_entries} of ${total_results} entries — Kiwix may have capped count=-1 (pagination needed)"
             rm -f "$LIBRARY_CACHE"
             return 1
         fi
@@ -488,18 +517,50 @@ Options:
    -p:[NUM]             Parallel connections (1-50)
    -m:[NUM[M|K]]        Max download speed
    -u:[size|newer|all]  Update criteria
-   --allow-unverified   Permit installs when no SHA-256 metalink is available
-                        (default: OFF — a missing hash blocks the download)
+   --allow-unverified   Permit installs when no SHA-256 metalink is available,
+                        falling back to size-only verification against the
+                        authoritative catalog size (default: OFF — a missing
+                        hash blocks the download). If neither a hash nor a
+                        catalog size is available the download is refused
+                        (a mirror-reported size is not accepted — it is circular)
    --https-only         Force HTTPS-only for the .zim download even when a
                         SHA-256 hash is present (default: OFF — an HTTP mirror
                         hop is permitted and verified by the hash)
+
+Environment:
+   KIWIX_WORK_DIR       Directory holding the ZIM files and state
+                        (default: /var/local/zims)
+   KIWIX_ZIM_LIBRARY    Path to library_zim.xml
+                        (default: /var/local/library_zim.xml in root mode;
+                        \$KIWIX_WORK_DIR/library_zim.xml in unprivileged mode)
 
 Examples:
    $(basename "$0") check-updates
    $(basename "$0") smart-update -u:size -m:5M
    $(basename "$0") smart-update -y -b
-   
-Note: This script must be run as root.
+   KIWIX_WORK_DIR=\$HOME/zims $(basename "$0") smart-update
+
+Run modes (selected automatically from the effective UID):
+   root          Manages the kiwix-serve service, chowns the library to
+                 root:root, and defaults to /var/local. WORK_DIR and all its
+                 ancestors must be root-owned and not group/other-writable.
+   unprivileged  Any non-root user, against a WORK_DIR they own (e.g. under
+                 \$HOME). Does no chown and does not touch the service. WORK_DIR
+                 and its ancestors must be owned by that user or root and not be
+                 group/other-writable — so keep WORK_DIR out of world-writable
+                 locations such as /tmp. kiwix-serve must be stopped first: the
+                 script refuses to run while it is up (or while it cannot check)
+                 unless you pass an explicit -y. Note -b alone does NOT override
+                 this safety refusal; use -b -y to override it in background.
+
+Notes:
+   * A non-root run against the default root-owned /var/local fails with a clear
+     permission error rather than silently downgrading; set KIWIX_WORK_DIR to a
+     directory you own to use unprivileged mode.
+   * Trust checks are ownership/permission based only (no ACL/NFS awareness) and
+     assume a local filesystem; the threat model is peer users, not root.
+   * Under sudo, pass -E (or set the KIWIX_* vars in the sudo environment) if you
+     need your KIWIX_WORK_DIR/KIWIX_ZIM_LIBRARY overrides to survive.
 EOF
 }
 
@@ -563,12 +624,14 @@ update_progress() {
     fi
 }
 
-# Is the Kiwix server active? Uses an init-system-agnostic fallback chain so a
-# false "stopped" (which would let us modify .zim files the server holds open ->
-# corruption) is avoided on non-systemd hosts. pidof matches the exact
-# kiwix-serve binary (unlike `pgrep -f`, which could match this updater's own
-# command line).
-_kiwix_is_active() {
+# Is the Kiwix server active, as seen by the SERVICE MANAGER (systemctl unit /
+# service(8)), with a pidof fallback on hosts that have neither? Uses an
+# init-system-agnostic chain so a false "stopped" (which would let us modify .zim
+# files the server holds open -> corruption) is avoided on non-systemd hosts.
+# Contrast _kiwix_serve_running, which checks the bare PROCESS only and is what
+# the unprivileged pre-flight uses. pidof matches the exact kiwix-serve binary
+# (unlike `pgrep -f`, which could match this updater's own command line).
+_kiwix_service_active() {
     local unit
     if command -v systemctl >/dev/null 2>&1; then
         for unit in kiwix-serve kiwix; do
@@ -612,7 +675,7 @@ manage_kiwix_service() {
             log "INFO" "Stopping Kiwix service"
             if _kiwix_service_do stop; then
                 sleep 2
-                if ! _kiwix_is_active; then
+                if ! _kiwix_service_active; then
                     log "INFO" "Kiwix service stopped"
                     touch "${WORK_DIR}/.kiwix_was_running"
                     _restrict_state_file "${WORK_DIR}/.kiwix_was_running"
@@ -626,7 +689,7 @@ manage_kiwix_service() {
             log "INFO" "Starting Kiwix service"
             if _kiwix_service_do start; then
                 sleep 2
-                if _kiwix_is_active; then
+                if _kiwix_service_active; then
                     log "INFO" "Kiwix service started"
                     return 0
                 fi
@@ -635,10 +698,96 @@ manage_kiwix_service() {
             return 1
             ;;
         status)
-            _kiwix_is_active
+            _kiwix_service_active
             return $?
             ;;
     esac
+}
+
+# True iff a tool to detect a running process (pidof or pgrep) is available.
+_kiwix_detection_available() {
+    command -v pidof >/dev/null 2>&1 || command -v pgrep >/dev/null 2>&1
+}
+
+# Direct detection of a running kiwix-serve process. Deliberately does NOT go
+# through _kiwix_service_active: that helper is systemctl-first and, on a systemd
+# host, returns after checking the kiwix-serve system UNIT — so it would miss a
+# bare, user-launched `kiwix-serve` process (exactly the case unprivileged mode
+# must catch). pidof/pgrep -x match the exact binary name. Callers must first
+# confirm _kiwix_detection_available: a bare "return 1" here means BOTH "no such
+# process" AND "no tool to check", which the pre-flight must not conflate.
+_kiwix_serve_running() {
+    if command -v pidof >/dev/null 2>&1; then
+        pidof kiwix-serve >/dev/null 2>&1 && return 0
+    fi
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -x kiwix-serve >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+# Announce that the running-server safety guard was overridden. Emitted to the
+# REAL stderr with printf — NOT via log(), whose console output is gated behind
+# `! ${QUIET}`; -b sets QUIET, so a log()-only warning would be buried in the log
+# file and the operator would never see that the guard was bypassed.
+_warn_serving_override() {
+    printf 'WARNING: %s; proceeding anyway (-y). Updated files may be served inconsistently until kiwix-serve is restarted.\n' "$1" >&2
+    log "WARN" "Serving guard overridden: $1; proceeding (-y)."
+}
+
+# Unprivileged mode cannot stop/restart kiwix-serve (service management is
+# root-only) and must not rewrite .zim/library files while a server is reading
+# them. So for the mutating commands, refuse to run while kiwix-serve is up (or
+# while we cannot even check — fail closed). This refusal is a DATA-SAFETY gate,
+# not an interactive prompt, so it is overridden only by an EXPLICIT -y — NOT by
+# the YES_TO_ALL that -b sets for prompt-suppression. A background (-b) run that
+# finds kiwix-serve up (or can't detect it) therefore fails closed rather than
+# silently corrupting a served collection; pass -b -y to override. Root mode is
+# unaffected — it stops and restarts the service itself.
+require_service_stopped_if_unprivileged() {
+    ${UNPRIVILEGED} || return 0
+
+    if ! _kiwix_detection_available; then
+        if ${EXPLICIT_YES}; then
+            _warn_serving_override "cannot verify kiwix-serve is stopped (no pidof/pgrep available)"
+            return 0
+        fi
+        log "ERROR" "Cannot verify kiwix-serve is stopped (install procps for pidof/pgrep, or pass -y to override)."
+        exit 1
+    fi
+
+    _kiwix_serve_running || return 0
+
+    if ${EXPLICIT_YES}; then
+        _warn_serving_override "kiwix-serve appears to be running"
+        return 0
+    fi
+    log "ERROR" "kiwix-serve is running, please stop it and try again"
+    exit 1
+}
+
+# Stop kiwix-serve before a mutation — ROOT MODE ONLY (unprivileged mode required
+# it already be stopped via the pre-flight and cannot manage the service). Returns
+# non-zero only when a running service could not be stopped. The .kiwix_was_running
+# marker that restore keys off is written by `manage_kiwix_service stop` itself (the
+# single writer). This is the shared seam for the mode gate; the KIWIX_BACKGROUND
+# skip is a do_smart_update call-site policy (see there), NOT part of this helper,
+# so `update-library -b` still manages the service exactly as it did before.
+stop_service_if_managed() {
+    if ${UNPRIVILEGED}; then return 0; fi
+    manage_kiwix_service status || return 0   # not running -> nothing to stop
+    manage_kiwix_service stop
+}
+
+# Restart kiwix-serve after a mutation iff we stopped it — ROOT MODE ONLY. The
+# single seam for the restore guard (mirror of stop_service_if_managed).
+restore_service_if_managed() {
+    if ${UNPRIVILEGED} || [ ! -f "${WORK_DIR}/.kiwix_was_running" ]; then
+        return 0
+    fi
+    log "INFO" "Restarting Kiwix service..."
+    manage_kiwix_service start || log "ERROR" "Failed to restore Kiwix service"
+    rm -f "${WORK_DIR}/.kiwix_was_running"
 }
 
 # True when the bulk .zim transfer must stay HTTPS-only: either the operator
@@ -741,8 +890,7 @@ verify_downloaded_file() {
     local file="$1"
     local temp_file="$2"
     local canonical_url="$3"    # origin URL (for the authoritative metalink)
-    local resolved_url="$4"     # redirect-resolved mirror URL (last-resort size source)
-    local expected_bytes="${5:-}"  # authoritative catalog size (preferred size source)
+    local expected_bytes="${4:-}"  # authoritative catalog size — required; no mirror fallback
 
     log "INFO" "Verifying downloaded file: $file"
 
@@ -765,8 +913,12 @@ verify_downloaded_file() {
         log "INFO" "SHA-256 verification passed"
         return 0
     elif [ "$rc" -eq 2 ]; then
-        log "WARN" "Transient error fetching metalink for $file — will retry"
-        return 1
+        # Transient metalink-fetch error (rc 2): NOT a definitive integrity
+        # failure. Signal the caller with a distinct rc 2 so it keeps the
+        # already-downloaded payload instead of discarding+re-downloading it
+        # (a multi-GB .zim must not be thrown away over a metalink HEAD blip).
+        log "WARN" "Transient error fetching metalink for $file — cannot verify this run"
+        return 2
     else
         # rc == 3: no verifiable hash (404 / 3xx / 200 without sha-256).
         if ! ${ALLOW_UNVERIFIED}; then
@@ -777,18 +929,17 @@ verify_downloaded_file() {
     fi
 
     # --- Size fallback (reached ONLY under --allow-unverified) ---
-    # Prefer the AUTHORITATIVE catalog size (from library.kiwix.org); only fall
-    # back to the mirror-reported size if the catalog size is unknown. Comparing
-    # against the mirror that served the bytes is circular (it supplies both the
-    # payload and the "expected" size), so it provides no real integrity (M5).
+    # Size-only verification requires an AUTHORITATIVE catalog size (from
+    # library.kiwix.org). A mirror-reported size is REFUSED: the mirror that
+    # served the bytes would supply both the payload and its "expected" size,
+    # which is circular and provides no integrity. With no catalog size we fail
+    # closed rather than rubber-stamp the download.
     local expected_size actual_size
     if [[ "$expected_bytes" =~ ^[0-9]+$ ]] && [ "$expected_bytes" -gt 0 ]; then
         expected_size="$expected_bytes"
-    elif ! expected_size=$(get_remote_size "$resolved_url"); then
-        log "ERROR" "Failed to get remote size for verification"
-        return 1
     else
-        log "WARN" "Authoritative catalog size unknown for $file — size fallback uses the mirror-reported size (no real integrity)"
+        log "ERROR" "No authoritative catalog size for $file — refusing size-only install against a mirror-supplied size (circular, no integrity)"
+        return 1
     fi
     actual_size=$(stat -c%s "$temp_file" 2>/dev/null) || return 1
     if [ "$actual_size" != "$expected_size" ]; then
@@ -1027,18 +1178,45 @@ download_file() {
         fi
 
         if [ "$aria_rc" -eq 0 ] && [ -f "$temp_file" ] && [ -s "$temp_file" ]; then
-            if verify_downloaded_file "$output" "$temp_file" "$url" "$final_url" "$expected_bytes"; then
-                success=true
-                if mv "$temp_file" "$output"; then
-                    log "INFO" "Successfully downloaded $filename"
-                else
-                    log "ERROR" "Failed to move $temp_file to $output"
+            # Three-way branch on the verify exit code (this whole body runs with
+            # set -e suspended — download_file is called via `if download_file`),
+            # so verify_downloaded_file's non-zero rc does NOT abort here:
+            #   0 => verified            -> install (mv temp_file -> output)
+            #   2 => TRANSIENT metalink  -> KEEP payload, do NOT re-download, fail
+            #        this run. A completed multi-GB .zim must not be discarded over
+            #        a metalink HEAD blip; the natural retry is the next scheduled
+            #        run, so break the OUTER retry loop WITHOUT rm-ing temp_file.
+            #   1 => DEFINITIVE failure  -> discard (rm) and let the outer loop
+            #        re-download from scratch (hash mismatch / no-hash-block / size).
+            local vrc
+            verify_downloaded_file "$output" "$temp_file" "$url" "$expected_bytes"
+            vrc=$?
+            case "$vrc" in
+                0)
+                    success=true
+                    if mv "$temp_file" "$output"; then
+                        log "INFO" "Successfully downloaded $filename"
+                    else
+                        log "ERROR" "Failed to move $temp_file to $output"
+                        success=false
+                    fi
+                    ;;
+                2)
+                    # KEEP temp_file (do NOT rm): this is not a stale-file leak.
+                    # A foreground run's cleanup() wipes TEMP_DIR at exit, so the
+                    # payload does not linger. A background run intentionally keeps
+                    # TEMP_DIR, so the completed-but-unverified payload survives and
+                    # the next run's aria2c (--continue=true) reuses it instead of
+                    # re-downloading a multi-GB .zim over a transient metalink blip.
+                    log "ERROR" "Metalink temporarily unavailable for $filename — not installing unverified; keeping payload for the next run"
                     success=false
-                fi
-            else
-                log "ERROR" "File verification failed for $filename"
-                rm -f "$temp_file"
-            fi
+                    break   # exit the OUTER retry loop; KEEP temp_file; do NOT re-run aria2c
+                    ;;
+                *)
+                    log "ERROR" "File verification failed for $filename"
+                    rm -f "$temp_file"   # definitive => discard, allow outer re-download
+                    ;;
+            esac
         else
             log "ERROR" "Download failed for $filename"
             rm -f "$temp_file"
@@ -1373,14 +1551,12 @@ do_smart_update() {
         return 0
     fi
     
-    # Stop Kiwix service if running
-    if [ -z "${KIWIX_BACKGROUND:-}" ] && manage_kiwix_service status; then
-        touch "${WORK_DIR}/.kiwix_was_running"
-        _restrict_state_file "${WORK_DIR}/.kiwix_was_running"
-        if ! manage_kiwix_service stop; then
-            log "ERROR" "Cannot proceed without stopping Kiwix service"
-            return 1
-        fi
+    # Stop Kiwix service if running (root mode only; see stop_service_if_managed).
+    # The background CHILD skips this: smart-update has always left the service
+    # alone under -b (unlike update-library, which manages it either way).
+    if [ -z "${KIWIX_BACKGROUND:-}" ] && ! stop_service_if_managed; then
+        log "ERROR" "Cannot proceed without stopping Kiwix service"
+        return 1
     fi
     
     # Backup library
@@ -1510,12 +1686,8 @@ do_smart_update() {
         update_kiwix_library
     fi
     
-    # Restore Kiwix service
-    if [ -f "${WORK_DIR}/.kiwix_was_running" ]; then
-        log "INFO" "Restarting Kiwix service..."
-        manage_kiwix_service start || log "ERROR" "Failed to restore Kiwix service"
-        rm -f "${WORK_DIR}/.kiwix_was_running"
-    fi
+    # Restore Kiwix service (root mode only; see restore_service_if_managed).
+    restore_service_if_managed
     
     # Final status
     if $update_success; then
@@ -1566,8 +1738,15 @@ clean_state() {
     # Create work directory if it doesn't exist
     mkdir -p "${WORK_DIR}" 2>/dev/null || true
     
-    # Clean up state files (use || true to prevent failures)
+    # Clean up state files (use || true to prevent failures).
+    # .kiwix_was_running is listed explicitly: the .kiwix_update* glob does NOT
+    # match it, so a stale marker from a hard-killed prior run would otherwise
+    # survive and make restore_service_if_managed start a service this run never
+    # stopped. Safe to clear here: clean_state runs before command dispatch, so
+    # only a stale marker is removed; the legitimate marker is written later by
+    # stop_service_if_managed.
     rm -f "${WORK_DIR}"/.kiwix_update* \
+          "${WORK_DIR}"/.kiwix_was_running \
           "${WORK_DIR}"/kiwix_update.log* \
           "${WORK_DIR}"/.heartbeat \
           "${STATUS_FILE}" \
@@ -1587,9 +1766,11 @@ clean_state() {
 # on. These helpers refuse to touch a state directory unless it (and every
 # ancestor) is root-owned and not group/other-writable.
 #
-# EXPECTED_OWNER_UID is an UNCONDITIONAL assignment (never ${VAR:-0}) so it can
-# never be overridden through the environment. Tests redefine the whole
-# is_trusted_dir / is_root_owned functions after sourcing — not this value.
+# EXPECTED_OWNER_UID defaults to 0 (never ${VAR:-0}) so it is never overridable
+# through the environment. determine_run_mode may set it — but only from the REAL
+# effective uid (`id -u`, which an attacker cannot forge without already holding
+# that uid): it stays literal 0 in root mode, and becomes the running uid ONLY in
+# unprivileged mode. Root mode's owner anchor therefore remains env-immutable.
 # ---------------------------------------------------------------------------
 EXPECTED_OWNER_UID=0
 TRUST_FAIL_REASON=""
@@ -1628,15 +1809,30 @@ _restrict_state_file() {
     [ -e "$1" ] && chmod 600 "$1" 2>/dev/null || true
 }
 
-# True if $1 is owned by EXPECTED_OWNER_UID. Overridable in tests.
-is_root_owned() {
+# True if $1 is owned by EXPECTED_OWNER_UID (root in root mode; the running user
+# in unprivileged mode).
+is_owned_by_expected() {
     local owner
     owner=$(stat -c%u "$1" 2>/dev/null) || return 1
     [ "$owner" = "$EXPECTED_OWNER_UID" ]
 }
 
-# True if $1 is a real directory, root-owned, not group/other-writable, and
-# every ancestor is likewise root-owned and not group/other-writable.
+# True iff an ANCESTOR owner uid ($1) is acceptable: EXPECTED_OWNER_UID or root.
+# The `0` is a hard-coded LITERAL (never a variable) so the root-TCB allowance can
+# never be relocated off root — do not parameterize it. Applies to ancestors only;
+# the leaf must match EXPECTED_OWNER_UID exactly (root is not accepted for a leaf).
+_ancestor_owner_ok() {
+    [ "$1" = "$EXPECTED_OWNER_UID" ] || [ "$1" = 0 ]
+}
+
+# True if $1 is a real directory owned by EXPECTED_OWNER_UID, not group/other-
+# writable, and every ANCESTOR is owned by EXPECTED_OWNER_UID *or root (0)* and
+# not group/other-writable. In root mode EXPECTED_OWNER_UID is 0, so the ancestor
+# set {0,0} collapses to {0} — identical to the original root-only rule. In
+# unprivileged mode a root-owned ancestor (e.g. /home, /) is trusted because root
+# is the TCB, which lets a user-owned WORK_DIR under $HOME pass; a peer-owned
+# ancestor is still rejected. The literal 0 is hard-coded (never a variable) so
+# the root-TCB allowance can't be moved off root.
 # Sets TRUST_FAIL_REASON to symlink|missing|owner|writable|ancestor on failure.
 # Owner and mode come exclusively from `stat -c` so a stat-shim governs tests.
 is_trusted_dir() {
@@ -1659,7 +1855,8 @@ is_trusted_dir() {
         cur=$(dirname "$cur")
         owner=$(stat -c%u "$cur" 2>/dev/null) || { TRUST_FAIL_REASON="ancestor"; return 1; }
         mode=$(stat -c%a "$cur" 2>/dev/null) || { TRUST_FAIL_REASON="ancestor"; return 1; }
-        if [ "$owner" != "$EXPECTED_OWNER_UID" ] || _mode_group_other_writable "$mode"; then
+        # Ancestor owner must be EXPECTED_OWNER_UID or root (the hard-coded TCB).
+        if ! _ancestor_owner_ok "$owner" || _mode_group_other_writable "$mode"; then
             TRUST_FAIL_REASON="ancestor"
             return 1
         fi
@@ -1667,17 +1864,29 @@ is_trusted_dir() {
     return 0
 }
 
+# Mode-aware remediation guidance (stderr).
+_trust_remediation() {
+    if [ "$EXPECTED_OWNER_UID" = 0 ]; then
+        printf "Remediation: 'chmod g-w,o-w' and 'chown root' the offending path (e.g. 'chmod g-w /var/local'), or set KIWIX_WORK_DIR to a root-owned path such as /var/lib/kiwix.\n" >&2
+    else
+        printf "Remediation (unprivileged): set KIWIX_WORK_DIR to a directory you own under a non-world-writable home (e.g. \"\$HOME/zims\"), or run as root (sudo) to use the system directory. WORK_DIR and its ancestors must not be group/other-writable.\n" >&2
+    fi
+}
+
 # Emit a targeted refusal message. Writes to STDERR directly (NOT log()): the
 # gate runs before LOG_FILE is safe to open, and a symlinked WORK_DIR would
 # otherwise redirect the log write (see LOGFILE_SAFE).
 _trust_refuse() {
     local dir="$1"
+    local who="uid ${EXPECTED_OWNER_UID}"
+    [ "$EXPECTED_OWNER_UID" = 0 ] && who="uid 0 (root)"
     case "$TRUST_FAIL_REASON" in
         symlink) printf 'ERROR: Refusing %s: it is a symlink (possible pre-plant attack).\n' "$dir" >&2 ;;
-        owner)   printf 'ERROR: Refusing %s: not owned by uid %s (root).\n' "$dir" "$EXPECTED_OWNER_UID" >&2 ;;
+        owner)   printf 'ERROR: Refusing %s: not owned by %s.\n' "$dir" "$who" >&2
+                 _trust_remediation ;;
         writable|ancestor)
-            printf 'ERROR: Refusing %s: it or an ancestor is group/other-writable or not root-owned.\n' "$dir" >&2
-            printf "ERROR: Remediation: 'chmod g-w,o-w' and 'chown root' the offending path (e.g. 'chmod g-w /var/local'), or set WORK_DIR to a root-owned path such as /var/lib/kiwix.\n" >&2
+            printf 'ERROR: Refusing %s: it or an ancestor is group/other-writable, or not owned by %s (root ancestors are allowed).\n' "$dir" "$who" >&2
+            _trust_remediation
             ;;
         *)       printf 'ERROR: Refusing %s: failed the trusted-directory check (%s).\n' "$dir" "${TRUST_FAIL_REASON:-unknown}" >&2 ;;
     esac
@@ -1697,9 +1906,23 @@ ensure_trusted_dirs() {
         else
             # Absent: ensure ancestors exist, then create the leaf NON-racily
             # (plain mkdir fails EEXIST if a symlink/dir was pre-planted).
-            mkdir -p "$(dirname "$dir")" 2>/dev/null || true
+            # Create intermediates under a scoped umask 022 so a lax caller umask
+            # (002/000) can't leave a group/other-writable ancestor that the gate
+            # would then reject (or, worse, a peer could pre-occupy).
+            ( umask 022; mkdir -p "$(dirname "$dir")" ) 2>/dev/null || true
             if ! mkdir "$dir" 2>/dev/null; then
-                log "ERROR" "Failed to create ${dir} (already exists as a symlink/file? pre-plant race?)."
+                # Distinguish a genuine pre-plant (the path is already occupied)
+                # from the common unprivileged case: the parent is not writable by
+                # us (e.g. a non-root user left at the default root-owned
+                # /var/local/zims). The latter gets the mode-aware remediation so
+                # the error is actionable, not a misleading "pre-plant race".
+                # Writes to stderr, not log(): LOG_FILE lives under this very dir.
+                if [ -e "$dir" ] || [ -L "$dir" ]; then
+                    printf 'ERROR: Refusing %s: it already exists as a symlink/file (possible pre-plant).\n' "$dir" >&2
+                else
+                    printf 'ERROR: Cannot create %s (parent directory not writable).\n' "$dir" >&2
+                    _trust_remediation
+                fi
                 return 1
             fi
             chmod 755 "$dir" || return 1
@@ -1712,13 +1935,13 @@ ensure_trusted_dirs() {
     return 0
 }
 
-# Echo the PID from PID_FILE only if the file is a regular (non-symlink),
-# root-owned file whose content is a plain PID; else return 1. Prevents acting
-# on an attacker-planted PID file and guarantees the value handed to kill is
-# strictly numeric.
+# Echo the PID from PID_FILE only if the file is a regular (non-symlink), file
+# owned by the expected uid whose content is a plain PID; else return 1. Prevents
+# acting on an attacker-planted PID file and guarantees the value handed to kill
+# is strictly numeric.
 read_trusted_pid() {
     [ ! -L "${PID_FILE}" ] || return 1          # never follow a symlinked PID file
-    is_root_owned "${PID_FILE}" || return 1
+    is_owned_by_expected "${PID_FILE}" || return 1
     local pid
     pid=$(cat "${PID_FILE}" 2>/dev/null) || return 1
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1        # only a bare PID is acceptable
@@ -1748,6 +1971,32 @@ create_pid_file() {
     return 1
 }
 
+# Resolve root vs unprivileged mode from the effective uid. euid 0 -> root mode
+# (EXPECTED_OWNER_UID pinned literal 0, today's behavior). Non-root -> unprivileged
+# mode: EXPECTED_OWNER_UID becomes the running uid and, unless the operator set
+# KIWIX_ZIM_LIBRARY, the library defaults under WORK_DIR (the root-mode default
+# /var/local is unwritable to a normal user). RUN_UID comes only from `id -u`,
+# never the environment, so root mode's owner anchor stays immutable.
+determine_run_mode() {
+    local RUN_UID
+    RUN_UID=$(id -u 2>/dev/null) || RUN_UID=""
+    if ! [[ "$RUN_UID" =~ ^[0-9]+$ ]]; then
+        printf 'Error: cannot determine effective uid (id -u returned %s)\n' "'${RUN_UID}'" >&2
+        exit 1
+    fi
+    if [ "$RUN_UID" -eq 0 ]; then
+        UNPRIVILEGED=false
+        EXPECTED_OWNER_UID=0
+    else
+        UNPRIVILEGED=true
+        EXPECTED_OWNER_UID="$RUN_UID"
+        # Empty is treated as unset, matching the header's :- default semantics.
+        if [ -z "${KIWIX_ZIM_LIBRARY:-}" ]; then
+            ZIM_LIBRARY="${WORK_DIR}/library_zim.xml"
+        fi
+    fi
+}
+
 main() {
     # Enable strict mode here (not at file scope) so sourcing for tests does not
     # impose these options on the caller's shell.
@@ -1756,29 +2005,32 @@ main() {
     # Save original arguments for background mode
     ORIGINAL_ARGS=("$@")
 
-    # Handle simple commands first. When run as root these touch WORK_DIR
-    # (check_status reads/removes PID_FILE; clean_state rm's state + TEMP_DIR),
-    # so gate them through the trusted-dir check before any destructive op.
-    # Non-root callers operate with their own privileges (no privesc), so the
-    # gate is euid-conditional.
+    # Help never needs a resolved mode — short-circuit before determine_run_mode
+    # (so a broken `id -u` can never abort `help`, and a bare call still prints it).
     case "${1:-help}" in
-        status)
-            if [ "$(id -u)" -eq 0 ]; then
-                ensure_trusted_dirs "${WORK_DIR}" || exit 1
-                LOGFILE_SAFE=true
-            fi
-            check_status
-            exit $?
-            ;;
         help|-h|--help)
             show_help
             exit 0
             ;;
+    esac
+
+    # Resolve root vs unprivileged mode before ANY WORK_DIR read/write below.
+    determine_run_mode
+
+    # Simple commands that touch WORK_DIR (check_status reads/removes PID_FILE;
+    # clean_state rm's state + TEMP_DIR): gate them through the trusted-dir check
+    # in BOTH modes before any destructive op (an unprivileged clean must not rm
+    # through a peer-planted symlinked WORK_DIR either).
+    case "${1:-help}" in
+        status)
+            ensure_trusted_dirs "${WORK_DIR}" || exit 1
+            LOGFILE_SAFE=true
+            check_status
+            exit $?
+            ;;
         clean)
-            if [ "$(id -u)" -eq 0 ]; then
-                ensure_trusted_dirs "${WORK_DIR}" || exit 1
-                LOGFILE_SAFE=true
-            fi
+            ensure_trusted_dirs "${WORK_DIR}" || exit 1
+            LOGFILE_SAFE=true
             clean_state
             echo "All logs and state files cleared"
             exit 0
@@ -1806,8 +2058,11 @@ main() {
     while getopts "hycbqp:m:vu:" opt; do
         case $opt in
             h) show_help; exit 0 ;;
-            y) YES_TO_ALL=true ;;
+            y) YES_TO_ALL=true; EXPLICIT_YES=true ;;
             c) CONTINUE_ON_ERROR=true ;;
+            # -b implies YES_TO_ALL (a background job can't answer prompts) but
+            # deliberately NOT EXPLICIT_YES: it must not disarm the unprivileged
+            # serving-guard. Pass -b -y to override that too.
             b) BACKGROUND=true; YES_TO_ALL=true; QUIET=true ;;
             q) QUIET=true ;;
             p)
@@ -1854,24 +2109,31 @@ main() {
 
     shift $((OPTIND-1))
 
-    # --- Privilege + trust gate: MUST precede ANY WORK_DIR read/write ---------
-    # Root check, dependency check, and the trusted-directory gate all run
-    # BEFORE the clean-start/PID handling, criteria write, and background fork
-    # below — otherwise those touch an unvalidated (possibly symlinked) WORK_DIR.
-    # This also fixes the old ordering where a non-root `-b` invocation forked a
-    # child before the root check (M5).
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "Error: This script must be run as root" >&2
-        exit 1
-    fi
+    # --- Dependency + trust gate: MUST precede ANY WORK_DIR read/write ---------
+    # The mode is already resolved (determine_run_mode, above). The dependency
+    # check and the trusted-directory gate run BEFORE the clean-start/PID handling,
+    # criteria write, and background fork below — otherwise those touch an
+    # unvalidated (possibly symlinked) WORK_DIR. There is no longer a hard root
+    # check here: a non-root user proceeds in unprivileged mode and is stopped, if
+    # at all, by the trust gate below with a precise, mode-aware message.
     if ! check_dependencies; then
         exit 1
     fi
-    # Also gate the directory that holds ZIM_LIBRARY: by default it is /var/local
-    # (group-writable on Debian, and OUTSIDE WORK_DIR), yet root does chmod/chown/mv
-    # on the library there — a non-root user could pre-plant a symlink to escalate.
+    # Also gate the directory that holds ZIM_LIBRARY: in root mode the default is
+    # /var/local (group-writable on Debian, OUTSIDE WORK_DIR), yet root does
+    # chmod/chown/mv on the library there — a non-root user could pre-plant a
+    # symlink to escalate. The gate validates it against EXPECTED_OWNER_UID.
     ensure_trusted_dirs "${WORK_DIR}" "${TEMP_DIR}" "${BACKUP_DIR}" "$(dirname "${ZIM_LIBRARY}")" || exit 1
     LOGFILE_SAFE=true   # WORK_DIR validated — LOG_FILE is now safe to open
+
+    # Unprivileged mode can't manage kiwix-serve; for the mutating commands,
+    # refuse to run (or warn under -y) while it is up. MUST precede clean_state,
+    # the criteria write, and the background fork so nothing is touched on refusal.
+    case "${COMMAND}" in
+        smart-update|update-library)
+            require_service_stopped_if_unprivileged
+            ;;
+    esac
 
     # Clean start handling (PID reads go through read_trusted_pid so an
     # attacker-planted, non-root-owned PID file is never acted upon).
@@ -1962,20 +2224,16 @@ main() {
             analyze_updates && do_smart_update || exit 1
             ;;
         update-library)
-            # Root + dependency + trusted-dir checks already ran in the gate above.
+            # Dependency + trusted-dir checks already ran in the gate above; the
+            # unprivileged pre-flight already ensured kiwix-serve is stopped.
 
-            # Stop Kiwix if running
-            if manage_kiwix_service status; then
-                manage_kiwix_service stop || exit 1
-            fi
-            
+            # Stop Kiwix if running (root mode only; see stop_service_if_managed).
+            stop_service_if_managed || exit 1
+
             update_kiwix_library
-            
-            # Restart if it was running
-            if [ -f "${WORK_DIR}/.kiwix_was_running" ]; then
-                manage_kiwix_service start || log "ERROR" "Failed to start Kiwix service"
-                rm -f "${WORK_DIR}/.kiwix_was_running"
-            fi
+
+            # Restart if it was running (root mode only).
+            restore_service_if_managed
             ;;
         stop)
             stop_update || exit 1

@@ -21,16 +21,39 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends shellcheck
       - name: Syntax check
-        run: bash -n kiwix-update.sh
+        run: |
+          bash -n kiwix-update.sh
+          # Fail fast on a test-suite syntax error before the execution loop.
+          find tests -name '*.sh' -print0 | xargs -0 -r -n1 bash -n
       # Gate the build at WARNING level so real issues (unquoted expansions,
       # word-splitting, unused vars) fail CI. SC2155 (declare-and-assign) is a
       # deliberate, pervasive style choice in this script and is excluded.
       - name: ShellCheck (warnings gate the build)
         run: shellcheck --severity=warning --exclude=SC2155 kiwix-update.sh
-      # Functional + security regression harness: exercises the real functions
+      # The CI test loop below *executes* every tests/*.sh, so the harnesses get the
+      # SAME warning-level lint as production (previously they ran unscanned). Same
+      # gate as production (--exclude=SC2155 only); SC2034/SC1090 false positives in
+      # verify_catalog_v2.sh are quarantined by file-scoped directives in that file,
+      # NOT a broad exclude here, so the unused-var/source checks stay live for every
+      # other suite. Empty-glob-safe via find -print0 | xargs -0 -r.
+      - name: ShellCheck test suites
+        run: find tests -name '*.sh' -print0 | xargs -0 -r shellcheck --severity=warning --exclude=SC2155
+      # Functional + security regression harnesses: exercise the real functions
       # with stubbed curl/aria2c/service managers (no network — the live smoke is
-      # gated behind KIWIX_LIVE, left unset here). Gates the security-critical
-      # catalog parsing, URL host-pin, transport/SSRF policy, and the
-      # do_smart_update return-code contract so a regression fails CI.
-      - name: Regression tests
-        run: bash tests/verify_catalog_v2.sh
+      # gated behind KIWIX_LIVE, left unset here). The loop auto-picks-up EVERY
+      # tests/*.sh so new suites gate CI without editing this workflow. Covered:
+      #   verify_catalog_v2.sh   — catalog parse, URL host-pin, transport/SSRF
+      #                            policy, download return-code contract, SHA-256
+      #                            integrity + disk-fill + update-decision arms.
+      #   verify_unprivileged.sh — trust-gate / run-mode / service-guard security
+      #                            suite (M6: previously never ran in CI).
+      #   verify_c1_sensitivity.sh — non-vacuity harness for the SHA-256 tests.
+      # ASSUMPTION — keep runs-on a NON-ROOT runner (ubuntu-latest): the unpriv
+      # suite self-skips its root-only case but its chmod-555 non-writable-parent
+      # assertion only holds as non-root. A root/container runner would break it.
+      - name: Run test suites
+        run: |
+          for t in tests/*.sh; do
+            echo "=== $t ==="
+            bash "$t" || exit 1
+          done
