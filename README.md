@@ -1,5 +1,13 @@
 # Kiwix Update Script
 
+[![ShellCheck & tests](https://github.com/kimon1230/kiwix-update/actions/workflows/shellcheck.yml/badge.svg?branch=main)](https://github.com/kimon1230/kiwix-update/actions/workflows/shellcheck.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Bash 4.4+](https://img.shields.io/badge/bash-4.4%2B-4EAA25?logo=gnubash&logoColor=white)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)
+[![Kiwix](https://img.shields.io/badge/for-Kiwix-000000)](https://kiwix.org)
+![Downloads: SHA-256 verified](https://img.shields.io/badge/downloads-SHA--256%20verified-2ea44f)
+[![ShellCheck](https://img.shields.io/badge/lint-ShellCheck-4EAA25)](https://www.shellcheck.net)
+
 This bash script automates the management and updating of ZIM files for Kiwix offline content servers. I developed it to handle my personal Kiwix deployment where manually tracking updates across dozens of educational content collections had become impractical.
 
 The script provides intelligent update detection, automated downloads, and library management while maintaining the integrity of existing Kiwix installations.
@@ -8,7 +16,14 @@ The script provides intelligent update detection, automated downloads, and libra
 
 The script interfaces with the Kiwix library catalog to identify available updates, compares them against local collections, and selectively downloads newer versions. It handles the complexities of ZIM file versioning and naming conventions that have evolved over time, ensuring compatibility across different content types and publishers.
 
-Key capabilities include differential update detection, robust download management with resumable downloads, and automated library synchronization.
+Key capabilities:
+
+- **Differential updates**: only ZIMs with a newer or larger catalog version are downloaded.
+- **Verified downloads**: every file is checked against the SHA-256 hash in the Kiwix metalink before it replaces anything.
+- **Resumable, multi-connection transfers** via aria2c, with bandwidth limits.
+- **Library synchronization** with `library_zim.xml`, without touching entries for ZIMs kept elsewhere.
+- **Safe to automate**: one run at a time, clean handling of Ctrl-C/SIGTERM (kiwix-serve is restarted), and exit codes that cron and systemd understand.
+- **Root or unprivileged**: manages the `kiwix-serve` service as root, or updates a directory you own without root.
 
 ## Dependencies
 
@@ -103,6 +118,15 @@ sudo ./kiwix-update.sh update-library
 
 # Monitor running processes
 sudo ./kiwix-update.sh status
+
+# Stop a background (-b) run, together with its download
+sudo ./kiwix-update.sh stop
+
+# Remove logs and state files (refused while a run is in progress)
+sudo ./kiwix-update.sh clean
+
+# Show all commands, options and environment variables
+./kiwix-update.sh help
 ```
 
 ### Configuration Options
@@ -165,7 +189,7 @@ File matching includes special handling for:
 
 During updates, the script:
 1. Pre-flights the library (if present: a regular file, not a symlink, readable; its directory writable) and takes one backup per run of a non-empty library — before anything is stopped or downloaded
-2. Checks the Kiwix service and temporarily stops it if running (root mode, foreground only — `-b` background runs and unprivileged runs leave the service alone)
+2. Checks the Kiwix service and temporarily stops it if running (root mode only). `smart-update -b` leaves the service alone (it keeps serving during long downloads); `update-library`, including `update-library -b`, stops and restarts it. Unprivileged runs never touch it.
 3. For each file: downloads, verifies, replaces, and immediately updates its library entry — so an interrupted run leaves every completed file consistent
 4. Restarts the service if it was running
 
@@ -174,6 +198,14 @@ If a library operation fails (e.g. `kiwix-manage` rejects a ZIM), the update con
 Only one run at a time: `check-updates`, `smart-update`, `update-library` and `clean` take an exclusive lock (`.kiwix_run.lock` in the working directory, via `flock`) before touching any state, and a second run is refused with "Another kiwix-update run is in progress" instead of interfering. A `-b` run keeps the lock until the background process finishes. When upgrading from a version without the lock, let any running `-b` update finish (or stop it) first: the new `stop` recognises a run only by the lock it holds. `stop` takes no lock; it signals the background run together with its download, so nothing is left running.
 
 If a run is interrupted (SIGTERM, Ctrl-C, SIGHUP) after it stopped `kiwix-serve`, it restarts the service before exiting, and exits with 143/130/129 so cron and systemd see the failure. Run `update-library` afterwards if a library update was in progress.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | Failure: a download or library operation failed (with or without `-c`), a run is already in progress, or a pre-flight check refused to start |
+| `129` / `130` / `143` | Interrupted by SIGHUP / SIGINT (Ctrl-C) / SIGTERM; kiwix-serve is restarted first if the run had stopped it |
 
 A missing or empty (0-byte) library file is initialised as a valid empty `<library>` on the next library update. If `kiwix-serve` reports that it cannot read the library (earlier versions of this script could leave a 0-byte file on a fresh install), run `update-library`.
 
@@ -199,8 +231,20 @@ sudo ./kiwix-update.sh status
 
 ### Common Issues
 
-**Silent execution failure:**
-Typically indicates missing dependencies or directory permissions. Verify all required packages are installed and directories exist with appropriate permissions.
+**Missing dependencies or permission errors at startup:**
+The script checks its required commands before doing anything and names any that are missing. It also refuses a working directory (or any parent) that another user could write to; see the permissions prerequisite under [Installation](#installation).
+
+**"Another kiwix-update run is in progress":**
+Another run holds the lock. With a PID in the message it is a background run: check it with `status`, or end it with `stop`. Otherwise it is a foreground run or a `clean`. Wait for it to finish; the lock is released automatically when the process exits, even if it crashes.
+
+**Run was interrupted (Ctrl-C, SIGTERM, `stop`):**
+kiwix-serve is restarted if the run had stopped it. Files that finished downloading are installed and listed in the library. Run `update-library` if the interruption came during a library update.
+
+**`kiwix-serve` says it cannot read the library:**
+Run `sudo ./kiwix-update.sh update-library`. It rebuilds a missing or empty library from the ZIMs in the working directory.
+
+**`-b` fails with "Background process failed to start":**
+The script must be executable (`chmod +x kiwix-update.sh`), because the background run re-launches it.
 
 **Network timeout errors:**
 Adjust timeout values or reduce parallel connections for unstable connections. The script includes automatic retry mechanisms for transient failures.
@@ -225,7 +269,7 @@ sudo ./kiwix-update.sh check-updates -v
 
 For institutional deployments, consider:
 
-- **Scheduling**: Use cron for regular automated updates
+- **Scheduling**: Use cron or a systemd timer for regular automated updates. The built-in lock makes overlapping runs safe: a second run is refused, not queued.
 - **Bandwidth management**: Implement rate limiting during business hours
 - **Storage planning**: Monitor disk usage trends for capacity planning
 - **Service continuity**: Schedule updates during low-usage periods
@@ -238,6 +282,11 @@ sudo ./kiwix-update.sh check-updates -u:all
 
 # Scheduled overnight updates
 sudo ./kiwix-update.sh smart-update -b -y -m:5M
+```
+
+Example root crontab entry (nightly at 02:30, quiet, non-interactive):
+```cron
+30 2 * * * /usr/local/bin/kiwix-update.sh smart-update -y -q -m:5M >/dev/null 2>&1
 ```
 
 ## File Organization
@@ -269,6 +318,8 @@ This project is released under the MIT License. See LICENSE file for full terms.
 ## Contributing
 
 Contributions are welcome. Please test thoroughly on non-production systems before submitting changes. The script is designed for educational and institutional use cases.
+
+Every push and pull request runs ShellCheck (pinned v0.10.0) and the offline test suites in `tests/` in CI; the badge at the top shows the latest result on `main`. Run them locally with `for t in tests/*.sh; do bash "$t"; done`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, how to run the test suites, the ShellCheck gate, and the conventions for writing tests and preserving the root/unprivileged run-mode invariant.
 
