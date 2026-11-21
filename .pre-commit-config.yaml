@@ -1,11 +1,13 @@
 # Run `pre-commit install` once to enable. Blocks secrets from being committed.
+# Revs are frozen to commit SHAs (a moved tag cannot change what runs); to bump,
+# resolve the new tag with `git ls-remote <repo> refs/tags/<tag>^{}`.
 repos:
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.21.2
+    rev: 43fae355e6fe4d99d2a7b240a224b85e2903aeb4  # frozen: v8.21.2
     hooks:
       - id: gitleaks
   - repo: https://github.com/koalaman/shellcheck-precommit
-    rev: v0.10.0
+    rev: 2491238703a5d3415bb2b7ff11388bf775372f29  # frozen: v0.10.0 (keep in lockstep with CI SHELLCHECK_VERSION)
     hooks:
       - id: shellcheck
         args: ["--severity=warning", "--exclude=SC2155"]

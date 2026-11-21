@@ -298,31 +298,169 @@ pf false false 1
 # only. determine_run_mode is overridden to force the mode; everything but the
 # guarded block is stubbed; manage_kiwix_service logs its calls; kiwix-serve
 # reported not-running so the pre-flight is a no-op.
-svc_case(){ # $1=UNPRIVILEGED(true/false) -> echoes manage_kiwix_service call log
+# $2 = update_kiwix_library body (default: return 0). Sets SVC_WD, SVC_RC and
+# SVC_CALLS (the call log; on `start` the stub also records the SigIgn mask an
+# exec'd child inherits). Call it directly, not in $(...), so the globals land.
+svc_case(){ # $1=UNPRIVILEGED(true/false) [$2=update_kiwix_library body]
     local WD LOG
-    WD=$(mktemp -d "$ROOT/svc.XXXXXX"); LOG="$WD/svc.calls"; : > "$LOG"
-    KIWIX_WORK_DIR="$WD" SVC_LOG="$LOG" KSERVE_RUNNING=0 MODE="$1" PATH="$PID_PATH" in_script '
+    WD=$(mktemp -d "$ROOT/svc.XXXXXX"); LOG="$WD/svc.calls"; : > "$LOG"; SVC_WD="$WD"
+    KIWIX_WORK_DIR="$WD" SVC_LOG="$LOG" KSERVE_RUNNING=0 MODE="$1" UKL="${2:-return 0}" PATH="$PID_PATH" in_script '
         determine_run_mode(){ UNPRIVILEGED="$MODE"; EXPECTED_OWNER_UID=0; RUN_UID=0; }
         ensure_trusted_dirs(){ return 0; }
         check_dependencies(){ return 0; }
         read_trusted_pid(){ return 1; }
         clean_state(){ return 0; }
         _restrict_state_file(){ return 0; }
-        update_kiwix_library(){ return 0; }
-        # Emulate the REAL manage_kiwix_service: `stop` writes the .kiwix_was_running
-        # marker on success (the single writer) so restore_service_if_managed fires.
-        manage_kiwix_service(){ printf "%s\n" "$1" >> "$SVC_LOG"; [ "$1" = stop ] && touch "${WORK_DIR}/.kiwix_was_running"; return 0; }
-        main update-library -y' >/dev/null 2>&1
-    cat "$LOG"
+        eval "update_kiwix_library(){ $UKL; }"
+        # Only logs calls: the REAL stop_service_if_managed writes the
+        # .kiwix_was_running marker (before the stop), so restore depends on it.
+        manage_kiwix_service(){ printf "%s\n" "$1" >> "$SVC_LOG"
+            [ "$1" = start ] && bash -c "grep ^SigIgn: /proc/self/status" >> "$SVC_LOG"; return 0; }
+        main update-library -y' > "$WD/out" 2>&1
+    SVC_RC=$?
+    SVC_CALLS=$(cat "$LOG")
 }
-r=$(svc_case false)
-{ printf '%s' "$r" | grep -q 'status' && printf '%s' "$r" | grep -q 'stop' && printf '%s' "$r" | grep -q 'start'; } \
-  && pass "B3.9 root: update-library manages kiwix-serve stop+start (positive control: '$(printf '%s' "$r" | tr '\n' ',')')" \
-  || fail "B3.9 root did not run full stop/start: '$r'"
-r=$(svc_case true)
+svc_case false; r="$SVC_CALLS"
+{ printf '%s' "$r" | grep -q 'status' && printf '%s' "$r" | grep -q 'stop' &&
+  [ "$(grep -cx start <<< "$r")" -eq 1 ] && [ "$SVC_RC" -eq 0 ] &&
+  ! grep -q Interrupted "$SVC_WD/out" "$SVC_WD/kiwix_update.log" 2>/dev/null; } \
+  && pass "B3.9 root: update-library stops kiwix-serve and starts it exactly once, rc 0 (positive control: '$(printf '%s' "$r" | tr '\n' ',')')" \
+  || fail "B3.9 root did not run stop + exactly one start: rc=$SVC_RC '$r'"
+# B3.9b: SIGTERM mid-update-library (after the service was stopped): the REAL
+# traps in main restart it exactly once, exit 143, clear the marker, and warn.
+# The restarted service's exec'd children must NOT inherit an ignored SIGTERM
+# (a `trap ''` during the restore would; the no-op handler doesn't).
+svc_case false 'kill -TERM $$'; r="$SVC_CALLS"
+ig=$(awk '/^SigIgn:/{print $2}' <<< "$r")
+{ [ "$SVC_RC" -eq 143 ] && [ "$(grep -cx start <<< "$r")" -eq 1 ] && [ -n "$ig" ] &&
+  [ $(( 0x$ig & 0x4000 )) -eq 0 ] && [ ! -e "$SVC_WD/.kiwix_was_running" ] &&
+  grep -q Interrupted "$SVC_WD/out" "$SVC_WD/kiwix_update.log" 2>/dev/null; } \
+  && pass "B3.9b SIGTERM after the service stop: restarted once, rc 143, marker cleared, SIGTERM not ignored by children" \
+  || fail "B3.9b rc=$SVC_RC sigign=$ig calls: $(tr '\n' ',' <<< "$r") out: $(tail -3 "$SVC_WD/out" | tr '\n' ' ')"
+for sig_rc in INT:130 HUP:129; do
+    svc_case false "kill -${sig_rc%%:*} \$\$"; r="$SVC_CALLS"
+    { [ "$SVC_RC" -eq "${sig_rc##*:}" ] && [ "$(grep -cx start <<< "$r")" -eq 1 ]; } \
+      && pass "B3.9b SIG${sig_rc%%:*}: restarted once, rc ${sig_rc##*:}" \
+      || fail "B3.9b SIG${sig_rc%%:*} rc=$SVC_RC calls: $(tr '\n' ',' <<< "$r")"
+done
+# B3.9c: the signal arrives DURING the stop (bash defers the trap until the
+# stop command returns). REAL manage_kiwix_service/stop_service_if_managed; only
+# the service-manager primitives are stubbed. The marker must already exist.
+WDM=$(mktemp -d "$ROOT/svcm.XXXXXX")
+KIWIX_WORK_DIR="$WDM" PATH="$PID_PATH" in_script '
+    determine_run_mode(){ UNPRIVILEGED=false; EXPECTED_OWNER_UID=0; RUN_UID=0; }
+    ensure_trusted_dirs(){ return 0; }
+    check_dependencies(){ return 0; }
+    read_trusted_pid(){ return 1; }
+    _restrict_state_file(){ return 0; }
+    update_kiwix_library(){ return 0; }
+    sleep(){ :; }
+    state=running
+    _kiwix_service_active(){ [ "$state" = running ]; }
+    _kiwix_service_do(){ echo "do $1" >> "${WORK_DIR}/calls"
+        if [ "$1" = stop ]; then state=stopped; kill -TERM $$; else state=running; fi; return 0; }
+    main update-library -y' > "$WDM/out" 2>&1
+rc=$?
+{ [ "$rc" -eq 143 ] && [ "$(grep -cx 'do start' "$WDM/calls")" -eq 1 ] && [ ! -e "$WDM/.kiwix_was_running" ]; } \
+  && pass "B3.9c SIGTERM during the service stop: still restarted exactly once (marker written before the stop)" \
+  || fail "B3.9c rc=$rc calls: $(tr '\n' ',' < "$WDM/calls" 2>/dev/null) out: $(tail -2 "$WDM/out" | tr '\n' ' ')"
+svc_case true; r="$SVC_CALLS"
 [ -z "$r" ] \
   && pass "B3.10 unpriv: update-library does NOT touch kiwix-serve" \
   || fail "B3.10 unpriv managed service: '$r'"
+
+# --- run lock through REAL main + REAL clean_state ----------------------------
+# A second run must refuse BEFORE clean_state: the live run's TEMP_DIR, service
+# marker and lock file all survive and the reconcile never runs. lk_case
+# yes|no [COMMAND ARGS] (default: update-library -y) -> LK_RC, LK_WD, LK_INO
+# (lock inode before the run); output in $ROOT/lk.out.
+lk_case(){
+    local hold="$1"; shift
+    local WD; WD=$(mktemp -d "$ROOT/lk.XXXXXX"); LK_WD="$WD"
+    mkdir -p "$WD/temp"; echo live > "$WD/temp/part.zim"; touch "$WD/.kiwix_was_running"
+    : > "$WD/.kiwix_run.lock"; LK_INO=$(stat -c %i "$WD/.kiwix_run.lock")
+    [ "$hold" = yes ] && { exec 7>>"$WD/.kiwix_run.lock"; flock -n 7; }
+    LK_ARGS="${*:-update-library -y}" KIWIX_WORK_DIR="$WD" PATH="$PID_PATH" in_script '
+        determine_run_mode(){ UNPRIVILEGED=true; EXPECTED_OWNER_UID=$(id -u); RUN_UID=$(id -u); }
+        ensure_trusted_dirs(){ return 0; }
+        check_dependencies(){ return 0; }
+        require_service_stopped_if_unprivileged(){ return 0; }
+        update_kiwix_library(){ echo RECONCILED >> "${WORK_DIR}/ul.log"; return 0; }
+        read_trusted_pid(){ return 1; }
+        # shellcheck disable=SC2086
+        main $LK_ARGS' > "$ROOT/lk.out" 2>&1
+    LK_RC=$?
+    [ "$hold" = yes ] && exec 7>&-
+    return 0
+}
+# lk_intact: the seeded live-run state (TEMP_DIR file, service marker, lock inode) survived.
+lk_intact(){ [ -f "$LK_WD/temp/part.zim" ] && [ -f "$LK_WD/.kiwix_was_running" ] &&
+             [ "$(stat -c %i "$LK_WD/.kiwix_run.lock")" = "$LK_INO" ]; }
+lk_case yes
+{ [ "$LK_RC" -eq 1 ] && grep -q "Another kiwix-update run is in progress" "$ROOT/lk.out" &&
+  [ -f "$LK_WD/temp/part.zim" ] && [ -f "$LK_WD/.kiwix_was_running" ] &&
+  [ "$(stat -c %i "$LK_WD/.kiwix_run.lock")" = "$LK_INO" ] && [ ! -e "$LK_WD/ul.log" ]; } \
+  && pass "B3.29 locked: second run refused before clean_state (TEMP_DIR, marker, lock inode intact)" \
+  || fail "B3.29 rc=$LK_RC out: $(tail -3 "$ROOT/lk.out" | tr '\n' ' ') temp=$([ -f "$LK_WD/temp/part.zim" ] && echo y || echo n)"
+lk_case no
+{ [ "$LK_RC" -eq 0 ] && [ -s "$LK_WD/ul.log" ] && [ ! -e "$LK_WD/temp/part.zim" ]; } \
+  && pass "B3.29b positive control: lock free -> clean_state runs and the reconcile is reached" \
+  || fail "B3.29b rc=$LK_RC out: $(tail -3 "$ROOT/lk.out" | tr '\n' ' ')"
+
+lk_case yes clean
+{ [ "$LK_RC" -eq 1 ] && grep -q "Another kiwix-update run is in progress" "$ROOT/lk.out" && lk_intact; } \
+  && pass "B3.30 'clean' during a live run: refused, the run's state survives" \
+  || fail "B3.30 rc=$LK_RC out: $(tail -2 "$ROOT/lk.out" | tr '\n' ' ')"
+# `stop` (no live PID here) and an unknown command must touch nothing: no
+# clean_state, no criteria file, no cleanup trap removing TEMP_DIR.
+lk_case no stop -y
+{ [ "$LK_RC" -eq 1 ] && lk_intact && [ ! -e "$LK_WD/.kiwix_update_criteria" ]; } \
+  && pass "B3.31 'stop' with no background run: rc 1, a live foreground run's state untouched" \
+  || fail "B3.31 rc=$LK_RC out: $(tail -2 "$ROOT/lk.out" | tr '\n' ' ')"
+lk_case no bogus -y
+{ [ "$LK_RC" -eq 1 ] && grep -q "Unknown command: bogus" "$ROOT/lk.out" && lk_intact &&
+  [ ! -e "$LK_WD/.kiwix_update_criteria" ]; } \
+  && pass "B3.31b unknown command: rejected before any state is touched" \
+  || fail "B3.31b rc=$LK_RC out: $(tail -2 "$ROOT/lk.out" | tr '\n' ' ')"
+
+# B3.32: `stop` signals the -b run's whole process group, so a long foreground
+# child (aria2c) dies with it instead of being orphaned. The fake run leads its
+# own group (as `nohup setsid` makes the real one) and waits on a sleep child.
+WDS=$(mktemp -d "$ROOT/stp.XXXXXX")
+# The fake run holds the run lock, as the real -b child does (stop_update
+# identifies the run by it), on fd 10 as during a `} 9>&-` call, and is named
+# unlike the script (a symlinked/renamed invocation must still be stoppable).
+# Each fake run records its own PID ($! is not the group leader under job control).
+setsid bash -c 'exec 10>>"$1/.kiwix_run.lock"; echo $$ > "$1/pid"; sleep 60 & echo $! > "$1/child"; wait' other-name "$WDS" </dev/null >/dev/null 2>&1 &
+for _ in $(seq 50); do [ -s "$WDS/child" ] && [ -s "$WDS/pid" ] && break; sleep 0.1; done
+runpid=$(cat "$WDS/pid" 2>/dev/null)
+printf '%s\n' "$runpid" > "$WDS/.kiwix_update.pid"
+t0=$SECONDS
+out=$(KIWIX_WORK_DIR="$WDS" in_script 'UNPRIVILEGED=true; EXPECTED_OWNER_UID=$(id -u); LOGFILE_SAFE=false
+    stop_update; echo "RC=$?"' 2>&1)
+child=$(cat "$WDS/child" 2>/dev/null)
+alive=no; kill -0 "$child" 2>/dev/null && alive=yes
+[ -n "$child" ] && kill "$child" 2>/dev/null
+{ [ -n "$child" ] && grep -qx 'RC=0' <<< "$out" && [ "$alive" = no ] && [ $((SECONDS - t0)) -lt 10 ]; } \
+  && pass "B3.32 stop identifies the run by its lock (any fd, any name) and kills its group: no orphaned child" \
+  || fail "B3.32 child alive=$alive took=$((SECONDS - t0))s out: $(tr '\n' ' ' <<< "$out")"
+
+# B3.33: a stale PID file whose number now belongs to an unrelated process group
+# (PID reuse) must not be signalled — not the process, and not its group. It is
+# even named like the script; it just doesn't hold the run lock.
+WDU=$(mktemp -d "$ROOT/stu.XXXXXX"); : > "$WDU/.kiwix_run.lock"
+setsid bash -c 'echo $$ > "$1/pid"; sleep 60 & echo $! > "$1/child"; wait' "$(basename "$SCRIPT")" "$WDU" </dev/null >/dev/null 2>&1 &
+for _ in $(seq 50); do [ -s "$WDU/child" ] && [ -s "$WDU/pid" ] && break; sleep 0.1; done
+otherpid=$(cat "$WDU/pid" 2>/dev/null)
+printf '%s\n' "$otherpid" > "$WDU/.kiwix_update.pid"
+out=$(KIWIX_WORK_DIR="$WDU" in_script 'UNPRIVILEGED=true; EXPECTED_OWNER_UID=$(id -u); LOGFILE_SAFE=false
+    rc=0; stop_update || rc=$?; echo "RC=$rc"' 2>&1)
+uchild=$(cat "$WDU/child" 2>/dev/null)
+ualive=no; [ -n "$uchild" ] && kill -0 "$otherpid" 2>/dev/null && kill -0 "$uchild" 2>/dev/null && ualive=yes
+kill -- "-$otherpid" 2>/dev/null
+{ [ -n "$otherpid" ] && [ "$ualive" = yes ] && grep -qx 'RC=1' <<< "$out" && grep -q "not a kiwix-update run" <<< "$out"; } \
+  && pass "B3.33 PID file naming an unrelated live process group (even named like the script): nothing signalled" \
+  || fail "B3.33 unrelated alive=$ualive out: $(tr '\n' ' ' <<< "$out")"
 
 # --- absent leaf under a non-writable parent: actionable, mode-aware error ----
 # The forgot-KIWIX_WORK_DIR case (non-root left at the root-owned /var/local/zims)
@@ -421,6 +559,17 @@ r=$(svc_helper stop_service_if_managed false no yes)
 { printf '%s' "$r" | grep -q status && printf '%s' "$r" | grep -q stop; } \
   && pass "B3.15 stop_service_if_managed ignores KIWIX_BACKGROUND (skip is a call-site concern)" \
   || fail "B3.15 got '$r'"
+# B3.15a root + running service, but the restore marker cannot be written:
+# refuse (rc 1) BEFORE stopping, so the service can never be left down unrecorded.
+WD=$(mktemp -d "$ROOT/svcha.XXXXXX"); LOG="$WD/calls"; : > "$LOG"
+out=$(KIWIX_WORK_DIR="$WD" SVC_LOG="$LOG" in_script '
+    UNPRIVILEGED=false; LOGFILE_SAFE=false
+    manage_kiwix_service(){ printf "%s\n" "$1" >> "$SVC_LOG"; return 0; }
+    touch(){ return 1; }
+    rc=0; stop_service_if_managed || rc=$?; echo "RC=$rc"' 2>&1)
+{ grep -qx 'RC=1' <<< "$out" && grep -q "Cannot write" <<< "$out" && ! grep -qx stop "$LOG"; } \
+  && pass "B3.15a marker unwritable: service not stopped, rc 1" \
+  || fail "B3.15a out: $(tr '\n' ' ' <<< "$out") calls: $(tr '\n' ',' < "$LOG")"
 # B3.15b root + service NOT running: status is checked, but no stop is issued.
 WD=$(mktemp -d "$ROOT/svchb.XXXXXX"); LOG="$WD/calls"; : > "$LOG"
 KIWIX_WORK_DIR="$WD" SVC_LOG="$LOG" in_script '
@@ -449,14 +598,15 @@ out=$(KIWIX_WORK_DIR="$WD" in_script '
 # --- do_smart_update stop CALL SITE (drives the real function, not just helper) -
 # Covers the "Cannot proceed" error wrapper and the KIWIX_BACKGROUND skip that is
 # unique to smart-update. is_safe_zim_name->1 makes the download loop a no-op.
-dsu(){ # $1=bg(yes/no) $2=stop_rc -> log (STOP/RESTORE/rc + captured stderr)
+dsu(){ # $1=bg(yes/no) $2=stop_rc [$3=preflight_rc] -> log (PREFLIGHT/STOP/RESTORE/rc + stderr)
     local WD LOG bg=""
     WD=$(mktemp -d "$ROOT/dsu.XXXXXX"); LOG="$WD/log"; : > "$LOG"
     [ "$1" = yes ] && bg=1
-    KIWIX_WORK_DIR="$WD" DSU_LOG="$LOG" KIWIX_BACKGROUND="$bg" STOP_RC="$2" in_script '
+    KIWIX_WORK_DIR="$WD" DSU_LOG="$LOG" KIWIX_BACKGROUND="$bg" STOP_RC="$2" PF_RC="${3:-0}" in_script '
         UNPRIVILEGED=false
         FILES_TO_UPDATE=("x|u|n|0")
         update_status(){ :; }; update_progress(){ :; }; backup_library_xml(){ :; }
+        _lib_preflight(){ printf "PREFLIGHT\n" >> "$DSU_LOG"; return "$PF_RC"; }
         update_kiwix_library(){ :; }; is_safe_zim_name(){ return 1; }
         stop_service_if_managed(){ printf "STOP\n" >> "$DSU_LOG"; return "$STOP_RC"; }
         restore_service_if_managed(){ printf "RESTORE\n" >> "$DSU_LOG"; return 0; }
@@ -475,12 +625,20 @@ seq=$(printf '%s' "$out" | grep -E '^(STOP|RESTORE)$' | tr '\n' ',')
 [ "$seq" = "STOP,RESTORE," ] \
   && pass "B3.24b do_smart_update foreground: STOP then RESTORE (choreography; positive control for B3.25)" \
   || fail "B3.24b wrong seq='$seq' out='$out'"
+out=$(dsu no 0 1)
+# A failing library pre-flight must abort BEFORE the service is stopped: nothing
+# restores it on that early return, so a stop here would leave kiwix-serve down.
+seq=$(printf '%s' "$out" | grep -E '^(PREFLIGHT|STOP|RESTORE)$' | tr '\n' ',')
+{ [ "$seq" = "PREFLIGHT," ] && printf '%s' "$out" | grep -q "rc=1"; } \
+  && pass "B3.24c do_smart_update: failing library pre-flight aborts BEFORE stopping the service" \
+  || fail "B3.24c wrong seq='$seq' out='$out'"
 out=$(dsu yes 1)
 # B3.24b above is the positive control: the body DOES log STOP when not skipped,
 # so this STOP-absent assertion genuinely proves the background skip.
-! printf '%s' "$out" | grep -q STOP \
+{ ! printf '%s' "$out" | grep -q STOP && printf '%s' "$out" | grep -qx PREFLIGHT \
+    && printf '%s' "$out" | grep -q '^rc='; } \
   && pass "B3.25 do_smart_update -b child: skips service management (smart-update -b policy preserved)" \
-  || fail "B3.25 stop called under background: '$out'"
+  || fail "B3.25 expected PREFLIGHT, rc=, and no STOP under background: '$out'"
 
 # --- positive control for the status/clean gate (guards the destructive rm path
 # against a vacuously-always-refusing gate) --------------------------------------

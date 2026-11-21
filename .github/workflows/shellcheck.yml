@@ -9,17 +9,38 @@ on:
 permissions:
   contents: read
 
+# Supersede stale runs on the same ref instead of queueing them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    # Suites are stub-driven (no network); a hang means a bug, not slowness.
+    timeout-minutes: 10
+    env:
+      SHELLCHECK_VERSION: v0.10.0
+      SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
     steps:
       # Pinned to a full commit SHA (not the mutable @v4 tag) to prevent tag
       # hijack from running attacker code in CI. Verify/refresh via Dependabot.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install shellcheck (pinned version)
+        with:
+          # Nothing here pushes; don't leave the token in .git/config.
+          persist-credentials: false
+      # Exact upstream release, hash-verified — apt's shellcheck floats with the
+      # runner image, so a new rule could break CI on an unchanged tree. Bump
+      # both env vars together (and re-lint locally) to upgrade.
+      - name: Install shellcheck (pinned + hash-verified)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck
+          tarball="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${tarball}"
+          echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
       - name: Syntax check
         run: |
           bash -n kiwix-update.sh
@@ -48,6 +69,9 @@ jobs:
       #   verify_unprivileged.sh — trust-gate / run-mode / service-guard security
       #                            suite (M6: previously never ran in CI).
       #   verify_c1_sensitivity.sh — non-vacuity harness for the SHA-256 tests.
+      #   verify_library_reconcile.sh — library reconcile: entries outside
+      #                            WORK_DIR survive, kiwix-style lexical path
+      #                            resolution, smart-update/update-library wiring.
       # ASSUMPTION — keep runs-on a NON-ROOT runner (ubuntu-latest): the unpriv
       # suite self-skips its root-only case but its chmod-555 non-writable-parent
       # assertion only holds as non-root. A root/container runner would break it.

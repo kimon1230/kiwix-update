@@ -20,6 +20,14 @@ service-account*.json
 .claude/
 .cursor/
 .aider*
+.continue/
+.copilot/
+.codeium/
+.windsurf/
+.tabnine/
+.sourcegraph/
+.envrc
+.direnv/
 CLAUDE.local.md
 .vscode/
 .idea/
@@ -37,6 +45,7 @@ desktop.ini
 *.part
 kiwix_update.log*
 .kiwix_update*
+.kiwix_run.lock
 .kiwix_library_cache*
 .heartbeat
 .library_zim_temp.*

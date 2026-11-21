@@ -14,8 +14,11 @@ container).
 Runtime commands the script itself requires (checked at startup):
 
 ```
-aria2c  kiwix-manage  curl  find  stat  numfmt  awk  df  grep  sha256sum  readlink
+aria2c  kiwix-manage  curl  find  stat  numfmt  awk  df  grep  sha256sum  readlink  realpath  flock  setsid
 ```
+
+The startup check also requires bash >= 4.4 and a GNU coreutils `realpath` that
+supports `-m -s -z` (library paths are resolved lexically, the way kiwix does).
 
 You do **not** need these installed to run the test suites — the harnesses stub
 `curl`/`aria2c`/service managers and drive the real functions offline.
@@ -49,7 +52,9 @@ KIWIX_LIVE=1 bash tests/verify_catalog_v2.sh
 
 ## Linting
 
-CI gates the build with ShellCheck at **warning** level:
+CI gates the build with ShellCheck **v0.10.0** (pinned + hash-verified in the
+workflow; keep it in lockstep with the `shellcheck-precommit` rev in
+`.pre-commit-config.yaml`) at **warning** level:
 
 ```bash
 shellcheck --severity=warning --exclude=SC2155 kiwix-update.sh

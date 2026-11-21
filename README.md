@@ -15,7 +15,7 @@ Key capabilities include differential update detection, robust download manageme
 Required system packages:
 ```bash
 sudo apt update
-sudo apt install aria2 kiwix-tools curl coreutils
+sudo apt install aria2 kiwix-tools curl coreutils util-linux   # util-linux (flock, setsid) is preinstalled on Debian/Ubuntu
 ```
 
 The script runs as **root** by default (managing the `kiwix-serve` service and
@@ -96,6 +96,9 @@ sudo ./kiwix-update.sh check-updates
 sudo ./kiwix-update.sh smart-update
 
 # Synchronize library with filesystem
+# (adds WORK_DIR ZIMs missing from the library; drops entries for WORK_DIR ZIMs
+#  that no longer exist; entries for ZIMs elsewhere, e.g. another disk or a
+#  WORK_DIR subdirectory, are left untouched)
 sudo ./kiwix-update.sh update-library
 
 # Monitor running processes
@@ -109,7 +112,7 @@ sudo ./kiwix-update.sh status
 -b                   Background execution
 -q                   Suppress output
 -v                   Verbose logging
--c                   Continue on errors
+-c                   Continue past per-file download errors (still exits non-zero; never past an unwritable library)
 -p:[NUM]             Parallel connections (1-50)
 -m:[SPEED]           Bandwidth limit (e.g., -m:5M)
 -u:[CRITERIA]        Update criteria (size|newer|all)
@@ -161,12 +164,18 @@ File matching includes special handling for:
 ### Service Integration
 
 During updates, the script:
-1. Verifies Kiwix service status
-2. Creates library backup
-3. Temporarily stops service if running
-4. Performs downloads and verification
-5. Updates library configuration
-6. Restarts service if previously active
+1. Pre-flights the library (if present: a regular file, not a symlink, readable; its directory writable) and takes one backup per run of a non-empty library — before anything is stopped or downloaded
+2. Checks the Kiwix service and temporarily stops it if running (root mode, foreground only — `-b` background runs and unprivileged runs leave the service alone)
+3. For each file: downloads, verifies, replaces, and immediately updates its library entry — so an interrupted run leaves every completed file consistent
+4. Restarts the service if it was running
+
+If a library operation fails (e.g. `kiwix-manage` rejects a ZIM), the update continues and the run exits non-zero; the error names the file. If the library itself can't be written, the run stops — even with `-c`, which only continues past per-file download failures — and you should run `update-library` after fixing the cause. Any failed file makes the run exit non-zero, with or without `-c`, so cron and systemd see the failure.
+
+Only one run at a time: `check-updates`, `smart-update`, `update-library` and `clean` take an exclusive lock (`.kiwix_run.lock` in the working directory, via `flock`) before touching any state, and a second run is refused with "Another kiwix-update run is in progress" instead of interfering. A `-b` run keeps the lock until the background process finishes. When upgrading from a version without the lock, let any running `-b` update finish (or stop it) first: the new `stop` recognises a run only by the lock it holds. `stop` takes no lock; it signals the background run together with its download, so nothing is left running.
+
+If a run is interrupted (SIGTERM, Ctrl-C, SIGHUP) after it stopped `kiwix-serve`, it restarts the service before exiting, and exits with 143/130/129 so cron and systemd see the failure. Run `update-library` afterwards if a library update was in progress.
+
+A missing or empty (0-byte) library file is initialised as a valid empty `<library>` on the next library update. If `kiwix-serve` reports that it cannot read the library (earlier versions of this script could leave a 0-byte file on a fresh install), run `update-library`.
 
 ### Download Management
 
@@ -240,14 +249,16 @@ sudo ./kiwix-update.sh smart-update -b -y -m:5M
 ├── backups/                     # Library configuration backups
 ├── kiwix_update.log             # Operation log
 ├── .kiwix_update_status         # Process status
+├── .kiwix_run.lock              # Run lock (one run at a time)
 └── .kiwix_library_cache         # Cached catalog data
 ```
 
 ## Technical Notes
 
-- Requires bash 4.0+ with standard POSIX utilities
+- Requires bash 4.4+ (namerefs, `mapfile -d`), GNU coreutils (`realpath -m -s`) and `flock`/`setsid` (util-linux)
 - Tested on Debian/Ubuntu systems (Raspberry Pi OS, Ubuntu Server)
 - Library and catalog parsing use bash regex, grep, and awk for compatibility (OPDS v2 catalog: `catalog/v2/entries`)
+- Library entries are matched by full path, resolved the way kiwix does (relative to the library file's directory, without following symlinks), so ZIMs you keep outside `WORK_DIR` stay in the library. Identical copies of one ZIM share a single library entry, because kiwix keys books by their UUID.
 - Download integrity verified via SHA-256 from the Kiwix metalink (metadata is HTTPS-only from kiwix.org; the hash gates the bulk transfer, so rotating HTTP mirrors are permitted by default — override with `--https-only`)
 - Atomic (intra-filesystem) rename on install prevents corruption during updates
 

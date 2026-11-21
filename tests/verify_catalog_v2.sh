@@ -86,6 +86,8 @@ S
 cat > "$ROOT/bin/aria2c" <<'S'
 #!/bin/bash
 echo "aria2c $*" >> "${ARIA_LOG:-/dev/null}"
+# Opt-in: record whether the run-lock fd 9 leaked into this exec'd child.
+[ -n "${ARIA_FD_LOG:-}" ] && { if [ -e /proc/self/fd/9 ]; then echo present; else echo "fd9 absent"; fi >> "$ARIA_FD_LOG"; }
 dir=""; out=""
 for a in "$@"; do case "$a" in --dir=*) dir="${a#--dir=}";; --out=*) out="${a#--out=}";; esac; done
 [ "${STUB_ARIA_RC:-0}" -eq 0 ] && [ -n "$dir" ] && [ -n "$out" ] && printf '%s' "${ARIA_CONTENT:-data}" > "$dir/$out"
@@ -145,8 +147,14 @@ E
 
 # valid: totalResults=1, 1 entry -> parses, returns 0
 mk_feed 1 entry_full; rm -f "$LIBRARY_CACHE"
+: > "$CURL_LOG"
 CATALOG="$ROOT/feed.xml" fetch_library_data >/dev/null 2>&1
 { [ $? -eq 0 ] && [ -s "$LIBRARY_CACHE" ]; } && pass "C1 valid feed parses (returns 0)" || fail "C1 valid feed rejected"
+# The catalog fetch follows no redirect: -L with --max-redirs 0 makes any 3xx a
+# hard error (without -L a 3xx body would be cached as the catalog).
+CAT_ARGV=$(grep -F 'catalog/v2/entries' "$CURL_LOG" | head -1)
+grep -qE -- ' -[a-zA-Z]*L[a-zA-Z]* ' <<< "$CAT_ARGV" && grep -qE -- ' --max-redirs 0( |$)' <<< "$CAT_ARGV" \
+  && pass "C1b catalog curl: -L --max-redirs 0 (no redirect followed)" || fail "C1b catalog curl argv: $(grep -F 'catalog/v2' "$CURL_LOG" | head -1)"
 # missing totalResults -> fail-closed
 mk_feed none entry_full; rm -f "$LIBRARY_CACHE"
 CATALOG="$ROOT/feed.xml" fetch_library_data >/dev/null 2>&1
@@ -285,6 +293,19 @@ grep -q 'aria2c ' "$ARIA_LOG" && pass "C5 relaxed: http mirror hop allowed (aria
 # resolved the terminal URL), and the curl resolve is capped at 1 hop.
 grep -qE -- '--max-redirect=0( |$)' "$ARIA_LOG" && pass "F1 aria2c --max-redirect=0 (no attacker-injectable redirect leg)" || fail "F1 aria2c --max-redirect not 0 ($(grep -o -- '--max-redirect=[0-9]*' "$ARIA_LOG"|head -1))"
 grep -qE -- '--max-redirs 1( |$)' "$CURL_LOG" && pass "F1 curl resolve bounded to 1 hop (--max-redirs 1)" || fail "F1 curl --max-redirs not 1"
+# The run lock (fd 9) must not leak into aria2c: download_file is defined with
+# `} 9>&-`. This shell's fd 9 is NOT close-on-exec, so without that it would.
+# rc is ignored (no metalink hash here, so the install is refused afterwards).
+LKD="$ROOT/lockdl"; : > "$LKD"; : > "$ARIA_LOG"; ARIA_FD="$ROOT/aria.fd"; : > "$ARIA_FD"
+exec 9>>"$LKD"; flock -n 9
+HTTPS_ONLY=false ALLOW_UNVERIFIED=false YES_TO_ALL=true ARIA_FD_LOG="$ARIA_FD" \
+  EFFECTIVE_URL="https://m.invalid/f.zim" SIZE_CL=100 \
+  download_file "https://lb.download.kiwix.org/zim/x/o.zim" "$WORK_DIR/c5fd.zim" 100 >/dev/null 2>&1
+held=$(bash -c 'exec 7>>"$1"; flock -n 7 && echo free || echo held' _ "$LKD")
+exec 9>&-
+{ grep -q 'aria2c ' "$ARIA_LOG" && [ "$(cat "$ARIA_FD")" = "fd9 absent" ] && [ "$held" = held ]; } \
+  && pass "C5fd aria2c runs without the run-lock fd; the caller still holds the lock" \
+  || fail "C5fd aria=$(grep -c 'aria2c ' "$ARIA_LOG") fd='$(tr '\n' ' ' < "$ARIA_FD")' lock=$held"
 # strict (--https-only): http mirror REFUSED, aria2c not invoked
 : > "$ARIA_LOG"
 HTTPS_ONLY=true YES_TO_ALL=true EFFECTIVE_URL="http://m.invalid/f.zim" MIRROR_SCHEME=http \
@@ -680,10 +701,23 @@ UPDATE_CRITERIA=all   # restore the harness global (leak is bidirectional)
 # ======================================================================
 if [ "${KIWIX_LIVE:-0}" = 1 ]; then
   echo; echo "########## LIVE smoke (KIWIX_LIVE=1) ##########"
-  T=/tmp/catv2_live.xml
-  if timeout 30 "$REAL_CURL" -sL --proto '=https' "https://library.kiwix.org/catalog/v2/entries?count=1" -o "$T" 2>/dev/null; then
-    ct=$(timeout 30 "$REAL_CURL" -sIL "https://library.kiwix.org/catalog/v2/entries?count=1" 2>/dev/null | grep -i '^content-type')
-    grep -qi 'xml' <<<"$ct" && pass "LIVE feed is XML" || fail "LIVE feed not XML: $ct"
+  T="$ROOT/catv2_live.xml"   # private temp dir, removed by the EXIT trap
+  # Watch the URL production actually uses (sourced above), not a copy of it.
+  LIVE_FEED="${KIWIX_LIBRARY_API%%\?*}?count=1"
+  # One fetch, deliberately WITHOUT -L — the drift alarm: production refuses any
+  # redirect (-L --max-redirs 0), so a catalog move would break every run. A 3xx
+  # here names the new location first; no response at all
+  # is a network problem, not a move, and is skipped like any unreachable endpoint.
+  live=$(timeout 30 "$REAL_CURL" -s --proto '=https' -o "$T" \
+    -w '%{http_code}\t%{content_type}\t%{redirect_url}' "$LIVE_FEED" 2>/dev/null)
+  IFS=$'\t' read -r feed_code ct feed_redirect <<<"$live"
+  if [[ "$feed_code" == 3?? ]]; then
+    fail "LIVE catalog URL redirects ($feed_code -> ${feed_redirect:-?}) — catalog moved? update KIWIX_LIBRARY_API"
+  elif [[ "$feed_code" == 4?? ]]; then
+    fail "LIVE catalog URL returns $feed_code — endpoint retired? update KIWIX_LIBRARY_API"
+  elif [ "$feed_code" = 200 ]; then
+    pass "LIVE catalog URL serves 200 directly (no redirect)"
+    if grep -qi 'xml' <<<"$ct"; then pass "LIVE feed is XML"; else fail "LIVE feed not XML: $ct"; fi
     grep -q '<totalResults>' "$T" && pass "LIVE <totalResults> present" || fail "LIVE totalResults missing"
     href=$(grep -oE 'href="https://lb\.download\.kiwix\.org[^"]+\.zim\.meta4"' "$T" | head -1 | sed 's/href="//;s/"$//')
     if [ -n "$href" ]; then
@@ -699,7 +733,7 @@ if [ "${KIWIX_LIVE:-0}" = 1 ]; then
       fail "LIVE no acquisition href found"
     fi
   else
-    echo "SKIP: live endpoint unreachable/timeout (non-flaky opt-in)"
+    echo "SKIP: live endpoint unreachable/timeout (code ${feed_code:-none}; non-flaky opt-in)"
   fi
 fi
 

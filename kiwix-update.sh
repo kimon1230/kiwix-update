@@ -13,8 +13,11 @@ LOG_FILE="${WORK_DIR}/kiwix_update.log"
 STATUS_FILE="${WORK_DIR}/.kiwix_update_status"
 PID_FILE="${WORK_DIR}/.kiwix_update.pid" 
 CRITERIA_FILE="${WORK_DIR}/.kiwix_update_criteria"
+# Exclusive run lock (flock on fd 9). Deliberately outside clean_state's
+# .kiwix_update* glob so a starting run can never delete a held lock.
+LOCK_FILE="${WORK_DIR}/.kiwix_run.lock"
 LIBRARY_CACHE="${WORK_DIR}/.kiwix_library_cache"
-KIWIX_LIBRARY_API="https://library.kiwix.org/catalog/v2/entries?count=-1"
+KIWIX_LIBRARY_API="https://opds.library.kiwix.org/catalog/v2/entries?count=-1"
 
 # Default values
 YES_TO_ALL=false
@@ -53,6 +56,13 @@ LOGFILE_SAFE=false
 
 declare -g CLEANUP_IN_PROGRESS=false
 declare -g FILES_TO_UPDATE=()
+# One library backup per run (taken by _lib_guard on the run's first reconcile or
+# pre-flight), so per-file reconciles
+# don't rotate real history out of the 5-backup window with identical copies.
+declare -g LIB_BACKED_UP=false
+# The reconcile's in-flight temp copy of the library, removed by cleanup() if the
+# run is killed mid-reconcile (empty when none is in flight).
+declare -g LIB_TEMP=""
 
 # Commands checked at preflight so a run fails fast rather than mid-operation.
 # Listed: the core externals (aria2c, kiwix-manage, curl) plus tools whose
@@ -73,6 +83,9 @@ REQUIRED_COMMANDS=(
     "grep"
     "sha256sum"
     "readlink"
+    "realpath"
+    "flock"
+    "setsid"
 )
 
 log() {
@@ -103,122 +116,297 @@ log() {
             printf '%s\n' "${message}"
         fi
     fi
+    # Explicit success: the DEBUG arm ends in `${DEBUG} && printf`, which would
+    # otherwise return 1 when DEBUG=false and abort a bare caller under set -e.
+    return 0
 }
 
-update_kiwix_library() {
-    log "INFO" "Updating Kiwix library..."
-    
-    # Backup current library first
-    backup_library_xml
-    
-    # Check if library file exists
-    if [ ! -f "${ZIM_LIBRARY}" ]; then
-        log "WARN" "Library file does not exist, creating new one"
-        touch "${ZIM_LIBRARY}"
-    fi
-    
-    # Get list of ZIM files currently in library
-    local library_files=()
-    local library_ids=()
-    
-    # Parse the XML to get current library entries
-    while IFS= read -r line; do
-        if [[ "$line" =~ \<book ]]; then
-            local book_id="" book_path=""
-            [[ "$line" =~ [[:space:]]id=\"([^\"]+)\" ]]   && book_id="${BASH_REMATCH[1]}"
-            [[ "$line" =~ [[:space:]]path=\"([^\"]+)\" ]] && book_path="${BASH_REMATCH[1]}"
-            if [ -n "$book_id" ] && [ -n "$book_path" ]; then
-                library_files+=("$(basename "$book_path")")
-                library_ids+=("$book_id")
-            fi
-        fi
-    done < "${ZIM_LIBRARY}"
-    
-    log "INFO" "Found ${#library_files[@]} files in library"
-    
-    # Find all ZIM files in directory
-    local found_files=()
-    while IFS= read -r -d '' file; do
-        found_files+=("$file")
-    done < <(find "${WORK_DIR}" -maxdepth 1 -type f -name "*.zim" -print0 | sort -z)
-    
-    log "INFO" "Found ${#found_files[@]} ZIM files in directory"
-    
-    # Add new files to library
-    local added_count=0
-    for file_path in "${found_files[@]}"; do
-        local filename=$(basename "$file_path")
-        local in_library=false
-        
-        for lib_file in "${library_files[@]}"; do
-            if [ "$filename" = "$lib_file" ]; then
-                in_library=true
-                break
-            fi
-        done
-        
-        if ! $in_library; then
-            log "INFO" "Adding $filename to library"
-            if kiwix-manage "${ZIM_LIBRARY}" add "$file_path"; then
-                added_count=$((added_count + 1))
-            else
-                log "ERROR" "Failed to add $filename to library"
-            fi
-        fi
+# --- Library path helpers -----------------------------------------------------
+# kiwix-manage stores each <book path="..."> RELATIVE to dirname(library) (absolute
+# when the library sits at /), XML-escaped, and kiwix resolves "../" LEXICALLY
+# (symlinked ancestors are NOT followed). These helpers reproduce exactly that so
+# the reconciler compares the same path kiwix-serve opens. None of them write to
+# stdout except their data, so they are safe inside $(...).
+
+# VARNAME -> decode the five predefined XML entities of $VARNAME in place (no fork).
+_lib_unescape() {
+    local -n _ue_s=$1
+    _ue_s="${_ue_s//&lt;/<}"
+    _ue_s="${_ue_s//&gt;/>}"
+    _ue_s="${_ue_s//&quot;/\"}"
+    _ue_s="${_ue_s//&apos;/\'}"
+    # &amp; MUST be last (decoding it first would turn "&amp;lt;" into "<"), and the
+    # replacement MUST be "\&": under bash >= 5.2's default patsub_replacement a bare
+    # "&" in the replacement means "the matched text", which would make this a no-op.
+    _ue_s="${_ue_s//&amp;/\&}"
+}
+
+# LIB_DIR P... -> NUL-separated lexical absolute paths: no per-entry forks, one
+# realpath call total. Makes no validation claims: _lib_load's count check is the
+# only error gate (a process-substitution consumer cannot see this rc).
+_lib_resolve_paths() {
+    local _rp_dir="$1" _rp_p; shift
+    [ $# -gt 0 ] || return 0
+    local -a _rp_abs=()
+    for _rp_p in "$@"; do
+        _lib_unescape _rp_p
+        [[ "$_rp_p" == /* ]] || _rp_p="$_rp_dir/$_rp_p"
+        _rp_abs+=("$_rp_p")
     done
-    
-    # Remove files from library that no longer exist.
-    # Anchor the temp in ZIM_LIBRARY's OWN directory (not WORK_DIR, which may be
-    # a different mount) so the final `mv` is an atomic intra-device rename and
-    # never a cross-device copy that could expose a half-written library.
-    local removed_count=0
-    local temp_library
-    temp_library=$(mktemp -p "$(dirname "${ZIM_LIBRARY}")" .library_zim_temp.XXXXXX) || return 1
-    cp "${ZIM_LIBRARY}" "$temp_library"
-    
-    # Check each library entry
-    for i in "${!library_files[@]}"; do
-        local lib_file="${library_files[$i]}"
-        local book_id="${library_ids[$i]}"
-        
-        if [ ! -f "${WORK_DIR}/${lib_file}" ]; then
-            log "INFO" "Removing $lib_file (ID: $book_id) from library - file no longer exists"
-            if kiwix-manage "$temp_library" remove "$book_id"; then
-                removed_count=$((removed_count + 1))
-            else
-                log "WARN" "Failed to remove $lib_file from library"
-            fi
+    realpath -ms -z -- "${_rp_abs[@]}"
+}
+
+# ARR_IDS ARR_PATHS -> parallel arrays of book ids and resolved absolute paths.
+# rc 0 = ok (empty when the library file is absent); rc 2 = could not read/resolve.
+# Namerefs and locals are _ll_-prefixed so no caller name can collide with them.
+_lib_load() {
+    local -n _ll_ids=$1 _ll_paths=$2
+    _ll_ids=(); _ll_paths=()
+    [ -f "$ZIM_LIBRARY" ] || return 0
+    local _ll_dir="" _ll_line _ll_id _ll_path
+    local -a _ll_raw=() _ll_resolved=()
+    _ll_dir=$(realpath -ms -- "$(dirname -- "$ZIM_LIBRARY")") && [ -n "$_ll_dir" ] || return 2
+    while IFS= read -r _ll_line || [ -n "$_ll_line" ]; do
+        [[ "$_ll_line" =~ \<book ]] || continue
+        _ll_id=""; _ll_path=""
+        [[ "$_ll_line" =~ [[:space:]]id=\"([^\"]+)\" ]]   && _ll_id="${BASH_REMATCH[1]}"
+        [[ "$_ll_line" =~ [[:space:]]path=\"([^\"]+)\" ]] && _ll_path="${BASH_REMATCH[1]}"
+        if [ -n "$_ll_id" ] && [ -n "$_ll_path" ]; then
+            _ll_ids+=("$_ll_id"); _ll_raw+=("$_ll_path")
         fi
-    done
-    
-    # Replace the library with the updated one if removals were successful
-    if [ $removed_count -gt 0 ] && [ -s "$temp_library" ]; then
-        mv "$temp_library" "${ZIM_LIBRARY}"
-    else
-        rm -f "$temp_library"
+    done < "$ZIM_LIBRARY" || return 2   # unreadable library = error, never "empty"
+    mapfile -d '' _ll_resolved < <(_lib_resolve_paths "$_ll_dir" "${_ll_raw[@]}")
+    if [ "${#_ll_resolved[@]}" -ne "${#_ll_raw[@]}" ]; then
+        _ll_ids=(); _ll_paths=(); return 2
     fi
-    
-    # Report results
-    log "INFO" "Library update complete: $added_count added, $removed_count removed"
-    
-    # Set proper permissions. Refuse if the target is a symlink (defense-in-depth
-    # against a redirected chmod/chown following a link to an arbitrary file);
-    # use --no-dereference on chown so it never follows a link. B1's trusted-dir
-    # gate is the primary protection — this is belt-and-suspenders.
+    _ll_paths=("${_ll_resolved[@]}")
+    return 0
+}
+
+# `update-library` command: reconcile with the service stopped, and ALWAYS restore
+# the service afterwards — a failed reconcile must not leave kiwix-serve down.
+# (Calling update_kiwix_library in this || context suspends errexit inside it,
+# which is why it checks every step itself.)
+cmd_update_library() {
+    stop_service_if_managed || return 1
+    local rc=0
+    update_kiwix_library || rc=$?
+    restore_service_if_managed
+    return "$rc"
+}
+
+# Gate run by EVERY library reconcile: refuse a symlinked library (defense-in-
+# depth; the trusted-dir gate covers the directory, not this file — _lib_load and
+# cp would read straight through it) or one that is not a regular file (e.g. a
+# directory), and take the run's single backup.
+# Returns 0 to proceed, 1 (with an ERROR logged) otherwise.
+_lib_guard() {
     if [ -L "${ZIM_LIBRARY}" ]; then
-        log "ERROR" "Refusing to chmod/chown ${ZIM_LIBRARY}: it is a symlink"
+        log "ERROR" "Refusing to update ${ZIM_LIBRARY}: it is a symlink — library not modified"
         return 1
     fi
-    chmod 644 "${ZIM_LIBRARY}"
+    # Present but not a regular file (e.g. a directory): _lib_load would read it
+    # as "absent" and the pre-flight would pass, then the first reconcile's cp
+    # would refuse only after an old ZIM was already deleted.
+    if [ -e "${ZIM_LIBRARY}" ] && [ ! -f "${ZIM_LIBRARY}" ]; then
+        log "ERROR" "Refusing to update ${ZIM_LIBRARY}: not a regular file — library not modified"
+        return 1
+    fi
+    if ! ${LIB_BACKED_UP}; then
+        if ! backup_library_xml; then
+            log "ERROR" "Library backup failed — library not modified"
+            return 1
+        fi
+        LIB_BACKED_UP=true
+    fi
+    return 0
+}
+
+# The library-level conditions update_kiwix_library refuses on (symlink,
+# non-regular file, backup, unparseable/unresolvable library, unwritable library
+# dir), checked up front so a caller (smart-update) can fail BEFORE stopping the
+# service or touching any file.
+# A later reconcile can still refuse on transient I/O (cp/mv or the empty-library
+# initialisation failing) or on kiwix-manage leaving an empty temp library.
+# Returns 0 if reconciles can proceed, 1 (with an ERROR logged) otherwise.
+_lib_preflight() {
+    _lib_guard || return 1
+    # shellcheck disable=SC2034  # filled via nameref by _lib_load; only its rc matters here
+    local -a _pf_ids=() _pf_paths=()
+    if ! _lib_load _pf_ids _pf_paths; then
+        log "ERROR" "Could not resolve library paths in ${ZIM_LIBRARY} — library not modified"
+        return 1
+    fi
+    local _pf_tmp=""
+    _pf_tmp=$(mktemp -p "$(dirname "${ZIM_LIBRARY}")" .library_zim_temp.XXXXXX) || {
+        log "ERROR" "Cannot create a temp file next to ${ZIM_LIBRARY} — library not modified"
+        return 1
+    }
+    rm -f "$_pf_tmp"
+    return 0
+}
+
+# Update Kiwix library — the SOLE writer of library state. Drops entries for
+# WORK_DIR ZIMs that no longer exist, then adds WORK_DIR ZIMs that are not listed.
+# Entries for ZIMs anywhere else (another disk, a WORK_DIR subdirectory) are not
+# ours and are left untouched.
+#   Args (optional): REFRESH_PATH... — WORK_DIR files replaced in place under the
+#   same name (same path, new book UUID/metadata). Their entries are removed and
+#   re-added, which path-based reconciling could not otherwise detect.
+# Returns 0 on success; 1 if it refused or aborted (library not modified, or
+# removals not applied); 2 if it completed but some kiwix-manage add/remove failed
+# (the ERROR lines name each file — it may be a bystander, not the REFRESH target).
+# Every step checks its own status: callers run this with errexit suspended.
+update_kiwix_library() {
+    log "INFO" "Updating Kiwix library..."
+
+    # Symlink / non-regular-file refusal + the run's one backup. (The parse and
+    # temp-dir checks of _lib_preflight are not repeated here: the body below
+    # fails closed on both.)
+    _lib_guard || return 1
+
+    local wd_abs=""
+    wd_abs=$(realpath -ms -- "${WORK_DIR}") && [ -n "$wd_abs" ] || {
+        log "ERROR" "Cannot resolve WORK_DIR ${WORK_DIR} — library not modified"
+        return 1
+    }
+    wd_abs="${wd_abs%/}"   # WORK_DIR=/ -> "" so the key and dirname rules agree
+
+    local -a lib_ids=() lib_paths=()
+    if ! _lib_load lib_ids lib_paths; then
+        log "ERROR" "Could not resolve library paths in ${ZIM_LIBRARY} — library not modified"
+        return 1
+    fi
+    log "INFO" "Found ${#lib_paths[@]} files in library"
+
+    local -A in_lib=() refresh=()
+    local p r
+    for p in "${lib_paths[@]}"; do in_lib["$p"]=1; done
+    for p in "$@"; do
+        r=$(realpath -ms -- "$p") && [ -n "$r" ] && refresh["$r"]=1
+    done
+
+    # Removals FIRST (on a temp copy, then one atomic mv), adds second: if a ZIM
+    # was renamed in place (same book UUID), kiwix-manage `add` rewrites that UUID's
+    # entry, and a later remove-by-id would then delete the freshly added book.
+    # The temp lives in ZIM_LIBRARY's OWN directory (not WORK_DIR, which may be a
+    # different mount) so the mv is an intra-device rename, never a copy.
+    local removed_count=0 external_count=0 failed_count=0 temp_library i
+    temp_library=$(mktemp -p "$(dirname "${ZIM_LIBRARY}")" .library_zim_temp.XXXXXX) || {
+        log "ERROR" "Cannot create a temp library — library not modified"; return 1; }
+    LIB_TEMP="$temp_library"   # every later path renames or removes it; cleanup() covers a kill
+    # Seed the temp from the existing library. A missing or 0-byte library has
+    # nothing to copy (the mktemp file is already empty) and must be initialised
+    # as an empty <library>: kiwix-manage and kiwix-serve both reject a 0-byte
+    # file ("Cannot read the library"), so a bare touch would make every add
+    # fail. A 0-byte one is what earlier versions of this script created on a
+    # fresh install. The skeleton is written into our temp and renamed into
+    # place (atomic: a failed write never leaves a partial or new empty file).
+    # There are no entries here, so the temp has no other use. No path here
+    # ever deletes a library.
+    if [ -s "${ZIM_LIBRARY}" ]; then
+        if ! cp "${ZIM_LIBRARY}" "$temp_library"; then
+            rm -f "$temp_library"; LIB_TEMP=""
+            log "ERROR" "Cannot copy ${ZIM_LIBRARY} — library not modified"
+            return 1
+        fi
+    else
+        if [ -e "${ZIM_LIBRARY}" ]; then
+            log "WARN" "Library file is empty (unreadable by kiwix), initialising it"
+        else
+            log "WARN" "Library file does not exist, creating new one"
+        fi
+        if ! { printf '<library version="20110515">\n</library>\n' > "$temp_library" &&
+               chmod 644 "$temp_library" && mv "$temp_library" "${ZIM_LIBRARY}"; }; then
+            rm -f "$temp_library"; LIB_TEMP=""
+            log "ERROR" "Cannot create ${ZIM_LIBRARY} — library not modified"
+            return 1
+        fi
+    fi
+    for i in "${!lib_paths[@]}"; do
+        p="${lib_paths[$i]}"
+        if [ "${p%/*}" != "$wd_abs" ]; then
+            external_count=$((external_count + 1))
+            continue
+        fi
+        if [ -f "$p" ] && [ -z "${refresh["$p"]:-}" ]; then
+            continue
+        fi
+        if [ -f "$p" ]; then
+            log "INFO" "Refreshing ${p##*/} (ID: ${lib_ids[$i]}) - replaced in place"
+        else
+            log "INFO" "Removing ${p##*/} (ID: ${lib_ids[$i]}) from library - file no longer exists"
+        fi
+        if kiwix-manage "$temp_library" remove "${lib_ids[$i]}"; then
+            removed_count=$((removed_count + 1))
+            unset 'in_lib[$p]'   # a refreshed file is then re-added below
+        else
+            log "ERROR" "Failed to remove ${p##*/} from library"
+            failed_count=$((failed_count + 1))
+        fi
+    done
+    if [ "$removed_count" -gt 0 ] && [ ! -s "$temp_library" ]; then
+        # kiwix-manage "succeeded" yet left nothing: never install that, and
+        # never pretend the removals happened (refreshed files would be
+        # re-added next to their stale entries).
+        rm -f "$temp_library"; LIB_TEMP=""
+        log "ERROR" "kiwix-manage left an empty temp library — removals not applied, library not modified"
+        return 1
+    elif [ "$removed_count" -gt 0 ]; then
+        if ! { chmod 644 "$temp_library" && mv "$temp_library" "${ZIM_LIBRARY}"; }; then
+            rm -f "$temp_library"; LIB_TEMP=""
+            log "ERROR" "Cannot replace ${ZIM_LIBRARY} — removals not applied"
+            return 1
+        fi
+    else
+        rm -f "$temp_library"   # (already gone if the library was just initialised)
+    fi
+    LIB_TEMP=""
+
+    local found_files=() file_path filename added_count=0
+    while IFS= read -r -d '' file_path; do
+        found_files+=("$file_path")
+    done < <(find "${WORK_DIR}" -maxdepth 1 -type f -name "*.zim" -print0 | sort -z)
+    log "INFO" "Found ${#found_files[@]} ZIM files in directory"
+
+    for file_path in "${found_files[@]}"; do
+        filename="${file_path##*/}"
+        [ -n "${in_lib["$wd_abs/$filename"]:-}" ] && continue
+        log "INFO" "Adding $filename to library"
+        if kiwix-manage "${ZIM_LIBRARY}" add "$file_path"; then
+            added_count=$((added_count + 1))
+        else
+            log "ERROR" "Failed to add $filename to library"
+            failed_count=$((failed_count + 1))
+        fi
+    done
+
+    log "INFO" "Library update complete: $added_count added, $removed_count removed, $failed_count failed, $external_count outside WORK_DIR left untouched"
+
+    # chmod and chown follow symlinks: re-check right before them. Best effort:
+    # this narrows the window rather than closing it (only the trusted dir's owner
+    # can swap the file). The library was already modified above, so a swap here
+    # is rc 2 (completed, an op failed), never rc 1 ("library not modified").
+    if [ -L "${ZIM_LIBRARY}" ] || [ ! -f "${ZIM_LIBRARY}" ]; then
+        log "ERROR" "${ZIM_LIBRARY} is no longer a regular file — chmod/chown skipped; check it"
+        return 2
+    fi
+    chmod 644 "${ZIM_LIBRARY}" || log "WARN" "Cannot chmod 644 ${ZIM_LIBRARY}"
     # Only root can (and should) hand the library to root:root. In unprivileged
     # mode the file stays owned by the running user — the trust gate already
     # requires WORK_DIR and its ancestors to be owned by that same user or root.
     if ! ${UNPRIVILEGED}; then
-        chown --no-dereference root:root "${ZIM_LIBRARY}"
+        chown --no-dereference root:root "${ZIM_LIBRARY}" || log "WARN" "Cannot chown root:root ${ZIM_LIBRARY}"
     fi
 
+    # A failed kiwix-manage add/remove means a book is missing or stale: report it.
+    if [ "$failed_count" -gt 0 ]; then
+        log "ERROR" "$failed_count library operation(s) failed — run 'update-library' after fixing the cause"
+        return 2
+    fi
     return 0
 }
+
 
 fetch_library_data() {
     local cache_age=3600  # Cache for 1 hour
@@ -239,7 +427,9 @@ fetch_library_data() {
     log "INFO" "Fetching latest library data from Kiwix..."
     
     # Get the root catalog with basic error handling
-    if curl -sL --proto '=https' --proto-redir '=https' --connect-timeout "$TIMEOUT" --max-time 60 --max-filesize 209715200 --fail "$KIWIX_LIBRARY_API" -o "${LIBRARY_CACHE}.tmp"; then
+    # -L with --max-redirs 0: any redirect is a hard error (curl 47). Without -L a
+    # 3xx is not an error under --fail and its body would be cached as the catalog.
+    if curl -sL --max-redirs 0 --proto '=https' --proto-redir '=https' --connect-timeout "$TIMEOUT" --max-time 60 --max-filesize 209715200 --fail "$KIWIX_LIBRARY_API" -o "${LIBRARY_CACHE}.tmp"; then
         # Parse the ATOM feed
         awk '
             length($0) > 100000 { next }   # skip absurdly long lines (DoS guard)
@@ -459,8 +649,10 @@ find_latest_zim() {
     return 0
 }
 
+# $1 = exit code to use (the signal traps pass 128+signo); default: the status
+# that triggered the EXIT trap.
 cleanup() {
-    local exit_code=$?
+    local exit_code=${1:-$?}
     if ${CLEANUP_IN_PROGRESS}; then
         return
     fi
@@ -483,6 +675,26 @@ cleanup() {
         rm -f "${PID_FILE}"
     fi
 
+    # A reconcile's temp copy of the library (set only while one is in flight).
+    if [ -n "${LIB_TEMP:-}" ]; then
+        rm -f -- "${LIB_TEMP}"
+    fi
+
+    if [ -n "${1:-}" ]; then
+        log "WARN" "Interrupted — if a library update was in progress, run 'update-library'"
+    fi
+    # Never leave kiwix-serve down because the run ended (or was signalled) after
+    # stopping it: the .kiwix_was_running marker is the single record of that, and
+    # restore is a no-op without it. Restore before removing TEMP_DIR so a slow
+    # rm -rf cannot delay the service. A no-op handler (NOT trap '': SIG_IGN is
+    # inherited across exec, so systemctl/service and a sysvinit-started
+    # kiwix-serve would ignore SIGTERM) keeps a second Ctrl-C from aborting the
+    # restart sequence (a child it hits directly can still die).
+    if [ -f "${WORK_DIR}/.kiwix_was_running" ]; then
+        trap ':' INT TERM HUP
+        restore_service_if_managed
+    fi
+
     # Clean up transient files if not in background mode
     if [ -z "${KIWIX_BACKGROUND:-}" ]; then
         [ -d "${TEMP_DIR}" ] && rm -rf "${TEMP_DIR}"
@@ -502,6 +714,7 @@ Commands:
    check-updates        Check which ZIM files need updating
    smart-update         Only download and update ZIM files that need updating
    update-library       Update Kiwix library to match ZIM files in directory
+                        (entries for ZIMs outside the directory are left alone)
    status               Show current update status
    stop                 Stop a running update process
    clean                Remove all logs and state files
@@ -510,7 +723,9 @@ Commands:
 Options:
    -h                   Show this help message
    -y                   Automatic yes to all prompts
-   -c                   Continue processing even if errors occur
+   -c                   Continue past per-file download errors (the run still
+                        exits non-zero; a library that cannot be written still
+                        stops the run)
    -b                   Run in background
    -q                   Quiet mode
    -v                   Verbose/debug mode
@@ -582,7 +797,19 @@ check_dependencies() {
         echo "Please install the missing dependencies." >&2
         return 1
     fi
-    
+
+    # Capabilities, not just presence: library path handling needs bash >= 4.4
+    # (namerefs, mapfile -d) and GNU coreutils realpath (-m -s -z). BusyBox/BSD
+    # realpath would otherwise make every library reconcile fail at run time.
+    if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+        echo "Error: bash >= 4.4 required (found ${BASH_VERSION})" >&2
+        return 1
+    fi
+    if ! realpath -ms -z -- /a/../b >/dev/null 2>&1; then
+        echo "Error: GNU coreutils realpath (supporting -m -s -z) is required" >&2
+        return 1
+    fi
+
     return 0
 }
 
@@ -650,7 +877,9 @@ _kiwix_service_active() {
 }
 
 # Start/stop the Kiwix service via systemctl (trying both unit names) then
-# service(8). Returns 0 on the first mechanism that succeeds.
+# service(8). Returns 0 on the first mechanism that succeeds. `9>&-` on the
+# definition: nothing started from here (e.g. a sysvinit kiwix-serve) may inherit
+# the run lock, while this script keeps holding it.
 _kiwix_service_do() {
     local action="$1" unit
     if command -v systemctl >/dev/null 2>&1; then
@@ -665,7 +894,7 @@ _kiwix_service_do() {
         service kiwix "$action" >/dev/null 2>&1 && return 0
     fi
     return 1
-}
+} 9>&-
 
 manage_kiwix_service() {
     local action="$1"
@@ -677,8 +906,6 @@ manage_kiwix_service() {
                 sleep 2
                 if ! _kiwix_service_active; then
                     log "INFO" "Kiwix service stopped"
-                    touch "${WORK_DIR}/.kiwix_was_running"
-                    _restrict_state_file "${WORK_DIR}/.kiwix_was_running"
                     return 0
                 fi
             fi
@@ -768,15 +995,27 @@ require_service_stopped_if_unprivileged() {
 
 # Stop kiwix-serve before a mutation — ROOT MODE ONLY (unprivileged mode required
 # it already be stopped via the pre-flight and cannot manage the service). Returns
-# non-zero only when a running service could not be stopped. The .kiwix_was_running
-# marker that restore keys off is written by `manage_kiwix_service stop` itself (the
-# single writer). This is the shared seam for the mode gate; the KIWIX_BACKGROUND
+# non-zero only when a running service could not be stopped. This is the single
+# writer of the .kiwix_was_running marker that restore keys off. It is written
+# BEFORE the stop: bash defers a signal trap until the foreground systemctl/sleep
+# returns, so a marker written after the stop would miss a signal that arrived
+# during it and leave kiwix-serve down. Starting an already-running service is
+# harmless; the marker is withdrawn only if a failed stop left it running.
+# This is the shared seam for the mode gate; the KIWIX_BACKGROUND
 # skip is a do_smart_update call-site policy (see there), NOT part of this helper,
 # so `update-library -b` still manages the service exactly as it did before.
 stop_service_if_managed() {
     if ${UNPRIVILEGED}; then return 0; fi
     manage_kiwix_service status || return 0   # not running -> nothing to stop
-    manage_kiwix_service stop
+    if ! touch "${WORK_DIR}/.kiwix_was_running"; then
+        log "ERROR" "Cannot write ${WORK_DIR}/.kiwix_was_running — not stopping kiwix-serve"
+        return 1
+    fi
+    _restrict_state_file "${WORK_DIR}/.kiwix_was_running"
+    if ! manage_kiwix_service stop; then
+        if manage_kiwix_service status; then rm -f "${WORK_DIR}/.kiwix_was_running"; fi
+        return 1
+    fi
 }
 
 # Restart kiwix-serve after a mutation iff we stopped it — ROOT MODE ONLY. The
@@ -831,7 +1070,7 @@ get_remote_size() {
 }
 
 # Fetch the Kiwix metalink (.meta4) for a canonical .zim URL and echo its
-# SHA-256. The metalink is fetched from the canonical origin (download.kiwix.org),
+# SHA-256. The metalink is fetched from the canonical origin (lb.download.kiwix.org),
 # NOT a mirror redirect, so the hash is authoritative even when the bytes come
 # from a mirror.
 # Return codes: 0 = 64-hex hash echoed on stdout;
@@ -930,7 +1169,7 @@ verify_downloaded_file() {
 
     # --- Size fallback (reached ONLY under --allow-unverified) ---
     # Size-only verification requires an AUTHORITATIVE catalog size (from
-    # library.kiwix.org). A mirror-reported size is REFUSED: the mirror that
+    # opds.library.kiwix.org). A mirror-reported size is REFUSED: the mirror that
     # served the bytes would supply both the payload and its "expected" size,
     # which is circular and provides no integrity. With no catalog size we fail
     # closed rather than rubber-stamp the download.
@@ -956,20 +1195,26 @@ backup_library_xml() {
     
     mkdir -p "${BACKUP_DIR}" || return 1
     
-    if [ ! -f "${ZIM_LIBRARY}" ]; then
-        log "WARN" "No library file to backup"
+    # A missing or 0-byte library has nothing restorable (kiwix rejects 0-byte);
+    # backing it up would only push a real backup out of the rotation.
+    if [ ! -s "${ZIM_LIBRARY}" ]; then
+        log "WARN" "No (non-empty) library file to backup"
         return 0
     fi
     
-    if ! cp "${ZIM_LIBRARY}" "$backup_file"; then
+    if ! install -m 644 -- "${ZIM_LIBRARY}" "$backup_file"; then
         log "ERROR" "Failed to create backup"
         return 1
     fi
     
     log "INFO" "Library backed up to: $backup_file"
     
-    # Keep only last 5 backups
-    ls -t "${BACKUP_DIR}"/library_zim_*.xml 2>/dev/null | tail -n +6 | xargs -r rm
+    # Keep only the 5 newest backups. NUL-separated end to end, so a BACKUP_DIR
+    # with spaces or other odd characters rotates correctly.
+    if ! find "${BACKUP_DIR}" -maxdepth 1 -type f -name 'library_zim_*.xml' -printf '%T@ %p\0' |
+            sort -zrn | tail -zn +6 | cut -zd' ' -f2- | xargs -0r rm -f --; then
+        log "WARN" "Could not rotate old library backups in ${BACKUP_DIR}"
+    fi
     
     return 0
 }
@@ -1224,7 +1469,7 @@ download_file() {
     done
     
     [ "$success" = true ]
-}
+} 9>&-   # aria2c and its helpers must not inherit the run lock (see acquire_run_lock)
 
 check_status() {
     local pid
@@ -1542,15 +1787,25 @@ do_smart_update() {
     local update_success=true
     local total_updated=0
     local total_failed=0
-    
+    local reconcile_partial=0 attempted=0 stopped_early=false
+
     log "INFO" "Starting smart update process"
     update_status "Starting update process"
-    
+
     if [ ${#FILES_TO_UPDATE[@]} -eq 0 ]; then
         log "INFO" "No files need updating"
         return 0
     fi
-    
+
+    # Pre-flight, before the service is stopped or any file is touched: every
+    # per-file reconcile below must be able to succeed, or old files would be
+    # deleted with their entries left dangling. Also takes the run's one backup.
+    # (This function runs with errexit suspended, so each check is explicit.)
+    if ! _lib_preflight; then
+        log "ERROR" "Library pre-flight failed — aborting before any download"
+        return 1
+    fi
+
     # Stop Kiwix service if running (root mode only; see stop_service_if_managed).
     # The background CHILD skips this: smart-update has always left the service
     # alone under -b (unlike update-library, which manages it either way).
@@ -1558,12 +1813,10 @@ do_smart_update() {
         log "ERROR" "Cannot proceed without stopping Kiwix service"
         return 1
     fi
-    
-    # Backup library
-    backup_library_xml
-    
+
     # Process updates
     for entry in "${FILES_TO_UPDATE[@]}"; do
+        attempted=$((attempted + 1))
         local f remote_url new_name expected_bytes
         f=$(echo "$entry" | cut -d'|' -f1)
         remote_url=$(echo "$entry" | cut -d'|' -f2)
@@ -1632,74 +1885,82 @@ do_smart_update() {
             total_updated=$((total_updated + 1))
             log "INFO" "Successfully downloaded ${new_name}.zim"
             
-            # Handle library and old file
             if [ "$f" != "$new_filepath" ] && [ -f "$f" ]; then
                 log "INFO" "Transitioning from $filename to ${new_name}.zim"
-                
-                # Remove old from library
-                local old_book_id=""
-                if [ -f "${ZIM_LIBRARY}" ]; then
-                    while IFS= read -r line; do
-                        # Literal (glob, quoted) substring match so regex
-                        # metacharacters in the filename are not interpreted (C3).
-                        if [[ "$line" == *"/${filename}\""* ]] || [[ "$line" == *"\"${filename}\""* ]]; then
-                            if [[ "$line" =~ id=\"([^\"]+)\" ]]; then
-                                old_book_id="${BASH_REMATCH[1]}"
-                                break
-                            fi
-                        fi
-                    done < "${ZIM_LIBRARY}"
-                fi
-                
-                if [ -n "$old_book_id" ]; then
-                    log "INFO" "Removing old entry from library"
-                    kiwix-manage "${ZIM_LIBRARY}" remove "$old_book_id" 2>/dev/null || true
-                fi
-                
-                # Add new to library
-                log "INFO" "Adding new file to library"
-                kiwix-manage "${ZIM_LIBRARY}" add "$new_filepath" 2>/dev/null || true
-                
-                # Remove old file
                 log "INFO" "Removing old file: $filename"
                 rm -f "$f"
-            else
-                # Same filename, check if in library
-                if [ -f "${ZIM_LIBRARY}" ]; then
-                    if ! grep -qF "${filename}\"" "${ZIM_LIBRARY}"; then
-                        log "INFO" "Adding ${filename} to library"
-                        kiwix-manage "${ZIM_LIBRARY}" add "$new_filepath" 2>/dev/null || true
-                    fi
-                fi
+            fi
+
+            # Reconcile NOW, per file, through the single library writer: an
+            # interrupted run (stop/SIGTERM/kill) then leaves every finished file
+            # consistent. Always refresh the target — it may have been overwritten
+            # in place (same path, new book UUID), which path matching cannot see;
+            # refreshing an unlisted file is just an add.
+            local rec_rc=0
+            update_kiwix_library "$new_filepath" || rec_rc=$?
+            if [ "$rec_rc" -eq 2 ]; then
+                # Reconcile ran; some kiwix-manage operation failed (possibly on an
+                # unrelated file — the ERROR above names it). Downloads are
+                # unaffected, so keep going; the run still ends as failed.
+                reconcile_partial=$((reconcile_partial + 1))
+                update_success=false
+                log "WARN" "Library reconcile after ${new_name}.zim completed with errors — continuing"
+            elif [ "$rec_rc" -ne 0 ]; then
+                # Refused: the library could not be safely rewritten (library-wide or
+                # tool-level cause),
+                # so ALWAYS stop — even with -c, which is for per-file download
+                # failures. Continuing would delete each remaining old file before a
+                # reconcile that is refused again, leaving N dangling entries.
+                update_success=false
+                log "ERROR" "Library reconcile refused after ${new_name}.zim — stopping"
+                stopped_early=true
+                break
             fi
         fi
-        
+
         # Update progress
         local current=$((total_updated + total_failed))
         local total=${#FILES_TO_UPDATE[@]}
         update_progress "$current" "$total" "$filename"
     done
-    
-    # Final library cleanup
-    if [ $total_updated -gt 0 ]; then
-        log "INFO" "Running final library cleanup..."
-        update_kiwix_library
-    fi
-    
+
     # Restore Kiwix service (root mode only; see restore_service_if_managed).
     restore_service_if_managed
     
-    # Final status
+    # Final status. Any failed file fails the run — also under -c, which only
+    # decides whether to keep going, not what the run reports (cron must see it).
+    if [ "$total_failed" -gt 0 ]; then
+        update_success=false
+    fi
     if $update_success; then
         log "INFO" "Smart update completed successfully"
         log "INFO" "Files updated: ${total_updated}"
-        [ $total_failed -gt 0 ] && log "WARN" "Files failed: ${total_failed}"
         return 0
     else
         log "ERROR" "Smart update completed with errors"
         log "ERROR" "Files updated: ${total_updated}, failed: ${total_failed}"
+        [ "$reconcile_partial" -gt 0 ] && log "ERROR" "Library operations failed during ${reconcile_partial} reconcile(s) — see the ERROR lines naming the files"
+        local remaining=$(( ${#FILES_TO_UPDATE[@]} - attempted ))
+        [ "$remaining" -gt 0 ] && log "ERROR" "Stopped early: ${remaining} file(s) not attempted"
+        if $stopped_early; then
+            log "ERROR" "Library reconcile was refused — run 'update-library' after fixing the cause"
+        fi
         return 1
     fi
+}
+
+# True when PID $1 holds this WORK_DIR's run lock open, i.e. it IS the live run
+# (identity by the lock, not by name: a symlinked or renamed invocation still
+# matches). A PID file left by a killed run can name a reused PID; stop_update
+# signals a whole process group, so it must never act on an unrelated process.
+# Every fd is checked: while download_file/_kiwix_service_do run (`} 9>&-`),
+# bash parks the lock on a different fd number.
+_is_our_run() {
+    local fd
+    for fd in /proc/"$1"/fd/*; do
+        [ "$fd" -ef "${LOCK_FILE}" ] && return 0
+    done
+    return 1
 }
 
 stop_update() {
@@ -1708,13 +1969,19 @@ stop_update() {
         log "ERROR" "No PID file found"
         return 1
     fi
-    if kill -0 "${pid}" 2>/dev/null; then
+    if kill -0 "${pid}" 2>/dev/null && _is_our_run "${pid}"; then
         log "INFO" "Stopping update process (PID: ${pid})"
-        kill "${pid}"
+        # A -b run leads its own process group (setsid): signal the whole group,
+        # so aria2c/sha256sum die with it and its trap runs at once (bash defers
+        # a trap until the foreground child exits) instead of being orphaned.
+        # The per-PID fallback is only defensive (a run that leads no group).
+        kill -TERM -- "-${pid}" 2>/dev/null || kill "${pid}"
 
-        # Wait up to 30 seconds for graceful shutdown
-        local count=0
-        while kill -0 "${pid}" 2>/dev/null && [ $count -lt 30 ]; do
+        # Wait for a graceful shutdown: 30s, or 120s when its cleanup will
+        # restart kiwix-serve (a systemd start can take a while).
+        local count=0 limit=30
+        [ -f "${WORK_DIR}/.kiwix_was_running" ] && limit=120
+        while kill -0 "${pid}" 2>/dev/null && [ $count -lt $limit ]; do
             sleep 1
             count=$((count + 1))
         done
@@ -1722,16 +1989,75 @@ stop_update() {
         # Force kill if still running
         if kill -0 "${pid}" 2>/dev/null; then
             log "WARN" "Forcing process termination"
-            kill -9 "${pid}"
+            kill -9 -- "-${pid}" 2>/dev/null || kill -9 "${pid}"
+            rm -f "${PID_FILE}"   # its cleanup never ran
+            if [ -f "${WORK_DIR}/.kiwix_was_running" ]; then
+                log "WARN" "The stopped run had stopped kiwix-serve and may not have restarted it — check it is running"
+            fi
         fi
 
         log "INFO" "Update process stopped"
         return 0
+    elif kill -0 "${pid}" 2>/dev/null; then
+        # Alive but not holding the run lock: a reused PID. Leave the file (the
+        # next run's clean_state clears it under the lock) and signal nothing.
+        log "WARN" "PID ${pid} is alive but is not a kiwix-update run — not signalling it"
+        return 1
     else
-        log "WARN" "No running update process found"
+        log "WARN" "No running update process found (stale PID file removed)"
         rm -f "${PID_FILE}"
         return 1
     fi
+}
+
+# Take the exclusive per-WORK_DIR run lock on fd 9, held until this process
+# exits. $1 = seconds to wait (default: refuse at once). A -b child re-asserts
+# the lock it inherited from its parent on the same open file description —
+# reopening would conflict with the parent's lock while the parent is still
+# alive. Long-lived children are started with fd 9 closed (see `} 9>&-`).
+acquire_run_lock() {
+    local wait_secs="${1:-}" pid holder="a run without a PID file, e.g. a foreground run"
+    if ! command -v flock >/dev/null 2>&1; then
+        log "ERROR" "flock not found (util-linux) — cannot take the run lock"
+        return 1
+    fi
+    if [ -n "${KIWIX_BACKGROUND:-}" ]; then
+        if [ ! -d /proc/self/fd ]; then
+            log "ERROR" "Cannot verify the inherited run lock (/proc not mounted)"
+            return 1
+        fi
+        if [ /proc/self/fd/9 -ef "${LOCK_FILE}" ] && flock -n 9; then
+            return 0
+        fi
+    fi
+    if [ -L "${LOCK_FILE}" ] || { [ -e "${LOCK_FILE}" ] && [ ! -f "${LOCK_FILE}" ]; }; then
+        log "ERROR" "Refusing lock file ${LOCK_FILE}: not a regular file"
+        return 1
+    fi
+    # Owner-only: flock works on a read-only fd, so a readable lock file would let
+    # any local user hold it and block every run. chmod also tightens an old one.
+    local um; um=$(umask)
+    umask 077
+    if ! { exec 9>>"${LOCK_FILE}"; } 2>/dev/null; then
+        umask "$um"
+        log "ERROR" "Cannot open lock file ${LOCK_FILE}"
+        return 1
+    fi
+    umask "$um"
+    chmod 600 "${LOCK_FILE}" 2>/dev/null || log "WARN" "Cannot chmod 600 ${LOCK_FILE}"
+    if [ -n "$wait_secs" ]; then
+        flock -n 9 && return 0
+        log "INFO" "Waiting up to ${wait_secs}s for the previous run to release the lock..."
+        flock -w "$wait_secs" 9 && return 0
+    else
+        flock -n 9 && return 0
+    fi
+    exec 9>&-
+    if pid=$(read_trusted_pid 2>/dev/null) && kill -0 "$pid" 2>/dev/null; then
+        holder="PID $pid"
+    fi
+    log "ERROR" "Another kiwix-update run is in progress (${holder}) — try again later"
+    return 1
 }
 
 clean_state() {
@@ -1742,9 +2068,13 @@ clean_state() {
     # .kiwix_was_running is listed explicitly: the .kiwix_update* glob does NOT
     # match it, so a stale marker from a hard-killed prior run would otherwise
     # survive and make restore_service_if_managed start a service this run never
-    # stopped. Safe to clear here: clean_state runs before command dispatch, so
-    # only a stale marker is removed; the legitimate marker is written later by
-    # stop_service_if_managed.
+    # stopped. Safe to clear here: clean_state runs under the run lock before
+    # command dispatch, so only a stale marker is removed; the legitimate marker
+    # is written later by stop_service_if_managed. A stale one means a previous
+    # run was killed after stopping kiwix-serve — say so rather than drop it silently.
+    if [ -f "${WORK_DIR}/.kiwix_was_running" ]; then
+        log "WARN" "A previous run stopped kiwix-serve and did not restart it — start it if it should be running"
+    fi
     rm -f "${WORK_DIR}"/.kiwix_update* \
           "${WORK_DIR}"/.kiwix_was_running \
           "${WORK_DIR}"/kiwix_update.log* \
@@ -2031,6 +2361,7 @@ main() {
         clean)
             ensure_trusted_dirs "${WORK_DIR}" || exit 1
             LOGFILE_SAFE=true
+            acquire_run_lock || exit 1   # never wipe a live run's state
             clean_state
             echo "All logs and state files cleared"
             exit 0
@@ -2135,27 +2466,54 @@ main() {
             ;;
     esac
 
-    # Clean start handling (PID reads go through read_trusted_pid so an
-    # attacker-planted, non-root-owned PID file is never acted upon).
-    local pid=""
+    # `stop` only signals a live background run: no lock, state cleanup,
+    # criteria write or cleanup trap, any of which would clobber the run being
+    # stopped (or a live foreground run, which has no PID file). Unknown commands
+    # are rejected here too, before any state file is written.
+    case "${COMMAND}" in
+        stop)
+            stop_update || exit 1
+            exit 0
+            ;;
+        check-updates|smart-update|update-library) ;;
+        *)
+            echo "Unknown command: ${COMMAND}" >&2
+            echo "Valid commands: check-updates, smart-update, update-library, status, stop, clean, help" >&2
+            show_help
+            exit 1
+            ;;
+    esac
+
+    # Interactive runs may offer to stop a live background run first (PID reads
+    # go through read_trusted_pid so a planted PID file is never acted upon).
+    local pid="" lock_wait=""
     if ! ${YES_TO_ALL}; then
-        if pid=$(read_trusted_pid) && kill -0 "$pid" 2>/dev/null; then
+        if pid=$(read_trusted_pid) && kill -0 "$pid" 2>/dev/null && _is_our_run "$pid"; then
             echo "An update process is running (PID: $pid)"
             read -p "Stop it and start fresh? (y/N) " -n 1 -r
             echo
             if [[ $REPLY =~ ^[Yy]$ ]]; then
                 stop_update || exit 1
+                # Its whole process group was signalled; a short-lived child still
+                # finishing (curl --max-time 60) may hold the lock briefly.
+                lock_wait=75
             else
                 echo "Aborted"
                 exit 1
             fi
         fi
+    fi
+
+    # Exclusive run lock, BEFORE any state mutation (clean_state, criteria write,
+    # background fork, cleanup trap): a refused run exits having touched nothing.
+    # The -b parent takes it here and its nohup child inherits fd 9.
+    acquire_run_lock "$lock_wait" || exit 1
+
+    # Holding the lock means no other run is live, so stale state is always
+    # cleared — except in the -b child: its parent cleaned before forking, and a
+    # second clean would race the parent's PID/criteria writes.
+    if [ -z "${KIWIX_BACKGROUND:-}" ]; then
         clean_state
-    else
-        # Non-interactive mode
-        if ! pid=$(read_trusted_pid) || ! kill -0 "$pid" 2>/dev/null; then
-            clean_state
-        fi
     fi
 
     # Save criteria
@@ -2172,7 +2530,10 @@ main() {
         exec 3>&1
         exec 1>>"${LOG_FILE}" 2>&1
 
-        nohup "$0" "${ORIGINAL_ARGS[@]}" </dev/null >>"${LOG_FILE}" 2>&1 &
+        # setsid: the child leads its own process group, so `stop` can signal it
+        # together with its aria2c/sha256sum. Not a group leader here, so setsid
+        # execs in place and $! stays the child's PID.
+        nohup setsid "$0" "${ORIGINAL_ARGS[@]}" </dev/null >>"${LOG_FILE}" 2>&1 &
         pid=$!
 
         # Exclusive create; refuse (and reap the child) if a live process
@@ -2213,7 +2574,9 @@ main() {
 
     # Set up cleanup
     trap 'cleanup' EXIT
-    trap 'cleanup' SIGTERM SIGINT SIGHUP
+    trap 'cleanup 143' SIGTERM
+    trap 'cleanup 130' SIGINT
+    trap 'cleanup 129' SIGHUP
 
     # Process commands
     case "$COMMAND" in
@@ -2227,21 +2590,10 @@ main() {
             # Dependency + trusted-dir checks already ran in the gate above; the
             # unprivileged pre-flight already ensured kiwix-serve is stopped.
 
-            # Stop Kiwix if running (root mode only; see stop_service_if_managed).
-            stop_service_if_managed || exit 1
-
-            update_kiwix_library
-
-            # Restart if it was running (root mode only).
-            restore_service_if_managed
-            ;;
-        stop)
-            stop_update || exit 1
+            cmd_update_library || exit 1
             ;;
         *)
-            echo "Unknown command: ${COMMAND}" >&2
-            echo "Valid commands: check-updates, smart-update, update-library, status, stop, clean, help" >&2
-            show_help
+            log "ERROR" "internal: no handler for command ${COMMAND}"
             exit 1
             ;;
     esac
