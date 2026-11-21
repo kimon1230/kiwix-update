@@ -1,6 +1,6 @@
 # Kiwix Update Script
 
-[![ShellCheck & tests](https://github.com/kimon1230/kiwix-update/actions/workflows/shellcheck.yml/badge.svg?branch=main)](https://github.com/kimon1230/kiwix-update/actions/workflows/shellcheck.yml)
+[![CI: ShellCheck, tests, secret scan](https://github.com/kimon1230/kiwix-update/actions/workflows/shellcheck.yml/badge.svg?branch=main)](https://github.com/kimon1230/kiwix-update/actions/workflows/shellcheck.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Bash 4.4+](https://img.shields.io/badge/bash-4.4%2B-4EAA25?logo=gnubash&logoColor=white)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)
@@ -319,7 +319,7 @@ This project is released under the MIT License. See LICENSE file for full terms.
 
 Contributions are welcome. Please test thoroughly on non-production systems before submitting changes. The script is designed for educational and institutional use cases.
 
-Every push and pull request runs ShellCheck (pinned v0.10.0) and the offline test suites in `tests/` in CI; the badge at the top shows the latest result on `main`. Run them locally with `for t in tests/*.sh; do bash "$t"; done`.
+Every push and pull request runs ShellCheck (pinned v0.10.0), the offline test suites in `tests/`, and a gitleaks secret scan of the full git history in CI; the badge at the top shows the latest result on `main`. Run them locally with `for t in tests/*.sh; do bash "$t"; done`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, how to run the test suites, the ShellCheck gate, and the conventions for writing tests and preserving the root/unprivileged run-mode invariant.
 

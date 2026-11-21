@@ -81,3 +81,33 @@ jobs:
             echo "=== $t ==="
             bash "$t" || exit 1
           done
+
+  # Secret scan of the full git history (not just the tip), so a secret that was
+  # committed and later deleted still fails CI. The pre-commit hook only sees
+  # local commits by people who installed it; this covers every push and PR.
+  # Same version as the pre-commit hook — bump both together.
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GITLEAKS_VERSION: 8.21.2
+      GITLEAKS_SHA256: 5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # full history
+          persist-credentials: false
+      # Exact upstream release binary, hash-verified (the gitleaks GitHub Action
+      # floats on a tag and needs a license key for organization repos).
+      - name: Install gitleaks (pinned + hash-verified)
+        run: |
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" gitleaks
+          sudo install -m 0755 "$RUNNER_TEMP/gitleaks" /usr/local/bin/gitleaks
+          gitleaks version
+      # --redact keeps any finding's secret out of the public CI log.
+      - name: Scan git history for secrets
+        run: gitleaks git --redact --no-banner --log-opts="--all" .
