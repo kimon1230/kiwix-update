@@ -30,8 +30,9 @@ fi
 sed 's/if \[ "\$actual_hash" != "\$expected_hash" \]; then/if [ "$actual_hash" = "$expected_hash" ]; then/' \
     "$orig" > "$inv"
 
-# Run the full suite against the inverted script; capture C1 verdict lines.
-out=$(SCRIPT="$inv" bash "$suite" 2>&1)
+# Run the suite against the inverted script; capture C1 verdict lines. The
+# end-to-end R cases are skipped: they are slow and irrelevant to the C1 gate.
+out=$(SKIP_E2E=1 SCRIPT="$inv" bash "$suite" 2>&1)
 
 check(){ # $1=grep pattern for the case  $2=human label
     local line

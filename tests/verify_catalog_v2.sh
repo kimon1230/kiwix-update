@@ -3,6 +3,8 @@
 # Exercises the REAL edited functions with a NON-VACUOUS arg-branching curl stub
 # (honours --proto-redir, -L, and a CURL_RESOLVE_FAIL knob) + an argv-logging
 # aria2c stub + inactive service stubs. sha256sum is REAL.
+# Also covers resumable partial downloads: unit-level (M1, RP) and end to end
+# through the real main via tests/lib/run_main.sh (R; SKIP_E2E=1 skips them).
 # Run from the repo root. Set KIWIX_LIVE=1 to also run the opt-in live smoke.
 
 # shellcheck disable=SC2034  # harness globals (WORK_DIR, QUIET, MIRROR_SCHEME, …) are consumed by the sourced kiwix-update.sh, which shellcheck can't see across the dynamic `source` below
@@ -24,69 +26,23 @@ REAL_CURL="$(command -v curl)"
 REAL_ARIA2C="${REAL_ARIA2C:-$(command -v aria2c)}"
 
 # ---------- stubs ----------
-cat > "$ROOT/bin/sleep" <<'S'
-#!/bin/bash
-exit 0
-S
+# sleep, curl, service managers and kiwix-manage come from the shared lib, which
+# also sets KUS, the run_main.sh driver for the end-to-end R cases, and the EXIT
+# trap (replacing the one above).
+# shellcheck source=lib/run_main.sh
+source "$(dirname "$(readlink -f "$0")")/lib/run_main.sh"
 
-# Non-vacuous curl stub. Logs full argv to $CURL_LOG. Branches:
-#   catalog fetch (-o, no -w, no head)  -> cp $CATALOG to -o target
-#   metalink (-w %{http_code})          -> write $META4_BODY, echo $META4_CODE
-#   resolve  (-w %{url_effective})      -> honour --proto-redir on EFFECTIVE_URL's
-#                                          scheme (refuse if out of set), and the
-#                                          CURL_RESOLVE_FAIL knob (network fail)
-#   HEAD probe (-sI/-sLI)               -> only returns Content-Length when -L is
-#                                          present AND the simulated mirror scheme
-#                                          ($MIRROR_SCHEME) is within --proto-redir
-cat > "$ROOT/bin/curl" <<'S'
-#!/bin/bash
-echo "curl $*" >> "${CURL_LOG:-/dev/null}"
-ofile=""; wfmt=""; head=false; proto_redir=""; hasL=false
-args=("$@"); i=0
-while [ $i -lt ${#args[@]} ]; do
-    a="${args[$i]}"
-    case "$a" in
-        -o) i=$((i+1)); ofile="${args[$i]}" ;;
-        -w) i=$((i+1)); wfmt="${args[$i]}" ;;
-        --proto-redir) i=$((i+1)); proto_redir="${args[$i]}" ;;
-        -sI|-I) head=true ;;
-        -sLI) head=true; hasL=true ;;
-        -L|--location) hasL=true ;;
-    esac
-    i=$((i+1))
-done
-scheme_of(){ printf '%s' "${1%%://*}"; }
-scheme_allowed(){ # $1 scheme, $2 like '=http,https'
-    local sch="$1" pv="${2#=}" t; local IFS=','
-    for t in $pv; do [ "$t" = "$sch" ] && return 0; done
-    return 1
-}
-if [[ "$wfmt" == *'%{http_code}'* ]]; then
-    [ -n "$ofile" ] && printf '%s' "${META4_BODY:-}" > "$ofile"
-    printf '%s' "${META4_CODE:-200}"; exit "${META4_EXIT:-0}"
-elif [[ "$wfmt" == *'%{url_effective}'* ]]; then
-    [ "${CURL_RESOLVE_FAIL:-0}" = 1 ] && exit 7          # simulate network failure
-    eff="${EFFECTIVE_URL:-https://mirror.invalid/final.zim}"
-    if [ -n "$proto_redir" ] && ! scheme_allowed "$(scheme_of "$eff")" "$proto_redir"; then
-        exit 1                                            # curl refuses out-of-set scheme
-    fi
-    printf '%s' "$eff"; exit 0
-elif $head; then
-    # Simulate the LB 302 -> mirror. Only follow (and return a size) when -L is
-    # present AND the mirror scheme is within the redirect proto set.
-    ms="${MIRROR_SCHEME:-https}"
-    if $hasL && { [ -z "$proto_redir" ] || scheme_allowed "$ms" "$proto_redir"; }; then
-        printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\n\r\n' "${SIZE_CL:-0}"
-    else
-        printf 'HTTP/1.1 302 Found\r\nLocation: %s://m/x\r\n\r\n' "$ms"   # no Content-Length
-    fi
-    exit 0
-fi
-[ -n "$CATALOG" ] && [ -n "$ofile" ] && cp "$CATALOG" "$ofile"
-exit 0
-S
+# Real df, captured before the stub bin is prepended to PATH.
+export REAL_DF="$(command -v df)"
 
-# aria2c: logs argv, writes $ARIA_CONTENT to --dir/--out
+# aria2c: logs argv, writes $ARIA_CONTENT (default "data"; set-but-empty writes
+# an empty file) to --dir/--out on rc 0 and then removes the .aria2 control file,
+# as real aria2c does. Knobs:
+#   STUB_ARIA_RC          exit code (default 0)
+#   STUB_ARIA_RC_SEQ      "7 0": the Nth call exits with the Nth code (counter in
+#                         $STUB_ARIA_RC_SEQ_FILE); past the end, STUB_ARIA_RC
+#   STUB_ARIA_PARTIAL=1   write a .part + .part.aria2 pair whatever the rc
+#   STUB_ARIA_BLOCK=FILE  write the pair, touch FILE ("started"), block <= 30 s
 cat > "$ROOT/bin/aria2c" <<'S'
 #!/bin/bash
 echo "aria2c $*" >> "${ARIA_LOG:-/dev/null}"
@@ -97,34 +53,56 @@ for a in "$@"; do case "$a" in --dir=*) dir="${a#--dir=}";; --out=*) out="${a#--
 [ -n "${STUB_ARIA_MSG:-}" ] && echo "$STUB_ARIA_MSG" >&2
 # Opt-in: record whether the temp file / control file existed when aria2c started.
 [ -n "${ARIA_PREEXIST_LOG:-}" ] && { [ -e "$dir/$out" ] && echo part; [ -e "$dir/$out.aria2" ] && echo ctl; echo end; } >> "$ARIA_PREEXIST_LOG"
-[ "${STUB_ARIA_RC:-0}" -eq 0 ] && [ -n "$dir" ] && [ -n "$out" ] && printf '%s' "${ARIA_CONTENT:-data}" > "$dir/$out"
-exit "${STUB_ARIA_RC:-0}"
+rc="${STUB_ARIA_RC:-0}"
+if [ -n "${STUB_ARIA_RC_SEQ:-}" ]; then
+    n=$(( $(cat "$STUB_ARIA_RC_SEQ_FILE" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$STUB_ARIA_RC_SEQ_FILE"
+    read -ra seq <<< "$STUB_ARIA_RC_SEQ"
+    [ "$n" -le "${#seq[@]}" ] && rc="${seq[n-1]}"
+fi
+p="$dir/$out"
+if [ -n "$dir" ] && [ -n "$out" ]; then
+    if [ "${STUB_ARIA_PARTIAL:-0}" = 1 ] || [ -n "${STUB_ARIA_BLOCK:-}" ]; then
+        printf 'partial' > "$p"; printf 'ctl' > "$p.aria2"
+    fi
+    if [ -n "${STUB_ARIA_BLOCK:-}" ]; then
+        : > "$STUB_ARIA_BLOCK"
+        exec "$REAL_SLEEP" 30
+    fi
+    [ "$rc" -eq 0 ] && printf '%s' "${ARIA_CONTENT-data}" > "$p"
+fi
+[ "$rc" -eq 0 ] && rm -f -- "$p.aria2"
+exit "$rc"
 S
 
-# Service manager: always inactive (so manage_kiwix_service is inert in tests)
-for c in systemctl service pidof; do
-    cat > "$ROOT/bin/$c" <<'S'
+# df: real unless STUB_DF_AVAIL is set; then, for any path, a header line and
+# that many available bytes (all the script reads is `df --output=avail -B 1 | tail -n 1`).
+# With STUB_DF_PARTS_DIR, the bytes allocated by *.zim.part files there are
+# subtracted, so deleting a partial frees space as on a real filesystem.
+cat > "$ROOT/bin/df" <<'S'
 #!/bin/bash
-exit 1
-S
-done
-# kiwix-manage: no-op success (post-success branch only; not reached by skip paths)
-cat > "$ROOT/bin/kiwix-manage" <<'S'
-#!/bin/bash
-exit 0
+[ -n "${STUB_DF_AVAIL:-}" ] || exec "$REAL_DF" "$@"
+held=0
+[ -n "${STUB_DF_PARTS_DIR:-}" ] && held=$(find "$STUB_DF_PARTS_DIR" -maxdepth 1 -name '*.zim.part' -printf '%b\n' 2>/dev/null | awk '{ s += $1 } END { print s * 512 }')
+printf 'Avail\n%s\n' "$(( STUB_DF_AVAIL - held ))"
 S
 chmod +x "$ROOT"/bin/*
 export PATH="$ROOT/bin:$PATH"
 
 # shellcheck source=/dev/null  # script-under-test is resolved dynamically at runtime
-source "${SCRIPT:-$(dirname "$(readlink -f "$0")")/../kiwix-update.sh}"
+source "$KUS"
 echo "SOURCED OK (main did not auto-run)"
 set +eu
 
+# Harness globals. The source-time state paths would otherwise point into the
+# R cases' KIWIX_WORK_DIR (exported by the lib), so pin them all here.
 WORK_DIR="$ROOT/work"; TEMP_DIR="$ROOT/work/temp"; BACKUP_DIR="$ROOT/work/backups"
 LOG_FILE="$ROOT/work/log"; LIBRARY_CACHE="$ROOT/work/.cache"; ZIM_LIBRARY="$ROOT/work/library.xml"
+STATUS_FILE="$ROOT/work/.kiwix_update_status"; PID_FILE="$ROOT/work/.kiwix_update.pid"
+CRITERIA_FILE="$ROOT/work/.kiwix_update_criteria"; LOCK_FILE="$ROOT/work/.kiwix_run.lock"
 QUIET=true; TIMEOUT=5; MAX_RETRIES=1
-export CURL_LOG="$ROOT/curl.log" ARIA_LOG="$ROOT/aria.log"
+EXPECTED_OWNER_UID=$(id -u)   # the files these unit cases create are ours (as in unprivileged mode)
+export CURL_LOG="$ROOT/curl.log"
 
 # ======================================================================
 echo; echo "########## C1 — <totalResults> truncation guard ##########"
@@ -544,7 +522,8 @@ echo; echo "########## M1 — transient (rc2) stops retrying vs definitive (rc1)
 #   rc 2 -> break WITHOUT re-running aria2c (fail this run; the hash is
 #           unreachable, so a re-download could not be verified either).
 #   rc 1 -> rm the .part and let the outer loop re-download from scratch.
-# Either way the .part is discarded: partials are not resumed across runs.
+# Either way the .part is discarded: a verify failure is never resumed. Only an
+# aria2c failure with a transient rc keeps a resumable .part + .part.aria2 pair.
 # Both cases run at MAX_RETRIES=2 so the aria2c-invocation count is discriminating
 # (the harness default MAX_RETRIES=1 runs aria2c exactly once either way -> vacuous).
 DL_TMP="$TEMP_DIR/m1out.zim.part"
@@ -561,20 +540,55 @@ rc=$?
 n_aria=$(grep -c 'aria2c ' "$ARIA_LOG")
 [ "$rc" -ne 0 ] && pass "M1 transient: download_file fails this run (rc=$rc)" || fail "M1 transient: rc=$rc (expected non-zero)"
 [ "$n_aria" -eq 1 ] && pass "M1 transient: aria2c invoked exactly once (payload NOT re-downloaded)" || fail "M1 transient: aria2c ran $n_aria times (expected 1)"
-[ ! -f "$DL_TMP" ] && pass "M1 transient: unverifiable .part discarded (not resumed across runs)" || fail "M1 transient: .part left behind"
+[ ! -f "$DL_TMP" ] && pass "M1 transient: verify-failure .part discarded (never resumed)" || fail "M1 transient: .part left behind"
 [ ! -f "$WORK_DIR/m1out.zim" ] && pass "M1 transient: nothing installed (fail-closed on integrity)" || fail "M1 transient: an unverified file was installed"
-# A leftover temp file and aria2c control file (e.g. from a killed run) must not
-# be handed to aria2c: it resumes from a leftover control file on its own, and a
-# stale or foreign temp file can yield correct-size, wrong-content data that
-# size-only verification would accept.
-M1_SEEN="$ROOT/m1.seen"; : > "$M1_SEEN"
-printf 'stale' > "$DL_TMP"; printf 'ctl' > "$DL_TMP.aria2"
-STUB_ARIA_RC=1 ARIA_PREEXIST_LOG="$M1_SEEN" YES_TO_ALL=true MIRROR_SCHEME=https SIZE_CL=100 \
+# A leftover .part + .part.aria2 pair (e.g. from a killed run) is handed to
+# aria2c, which resumes from its control file; a transient failure (rc 7) keeps
+# it for the next attempt. A .part without its control file, or any pair under
+# --allow-unverified (size-only verification could accept a spliced file), is
+# removed before aria2c starts. m1_left SEED RC ALLOW -> M1_SEEN_OUT, M1_PART, M1_CTL
+M1_SEEN="$ROOT/m1.seen"
+m1_left(){
+    : > "$M1_SEEN"; rm -f "$DL_TMP" "$DL_TMP.aria2"
+    printf 'stale' > "$DL_TMP"; [ "$1" = pair ] && printf 'ctl' > "$DL_TMP.aria2"
+    STUB_ARIA_RC="$2" ALLOW_UNVERIFIED="$3" ARIA_PREEXIST_LOG="$M1_SEEN" YES_TO_ALL=true \
+      MIRROR_SCHEME=https SIZE_CL=100 EFFECTIVE_URL="https://m.invalid/f.zim" \
+      download_file "https://lb.download.kiwix.org/zim/x/m1out.zim" "$WORK_DIR/m1out.zim" >/dev/null 2>&1
+    M1_SEEN_OUT=$(tr '\n' ' ' < "$M1_SEEN"); M1_PART=$([ -e "$DL_TMP" ]&&echo y||echo n); M1_CTL=$([ -e "$DL_TMP.aria2" ]&&echo y||echo n)
+}
+m1_left pair 7 false
+{ [ "$M1_SEEN_OUT" = "part ctl end " ] && [ "$M1_PART$M1_CTL" = yy ]; } \
+  && pass "M1 leftover pair is resumed (aria2c sees .part + .part.aria2) and kept after a transient failure (rc 7)" \
+  || fail "M1 leftover pair: seen-at-start='$M1_SEEN_OUT' part=$M1_PART ctl=$M1_CTL"
+m1_left orphan 7 false
+{ [ "$M1_SEEN_OUT" = "end " ] && [ "$M1_PART$M1_CTL" = nn ]; } \
+  && pass "M1 leftover .part without .part.aria2 is removed before aria2c starts (and not kept after rc 7)" \
+  || fail "M1 orphan .part: seen-at-start='$M1_SEEN_OUT' part=$M1_PART ctl=$M1_CTL"
+m1_left pair 7 true
+{ [ "$M1_SEEN_OUT" = "end " ] && [ "$M1_PART$M1_CTL" = nn ]; } \
+  && pass "M1 --allow-unverified: leftover pair removed before aria2c starts (and not kept after rc 7)" \
+  || fail "M1 allow-unverified pair: seen-at-start='$M1_SEEN_OUT' part=$M1_PART ctl=$M1_CTL"
+# Failure-branch allowlist: transient rcs (and signals other than SIGXFSZ=153)
+# keep the pair; everything else drops it.
+for m1_rc in 2 6 7 19 29 130 143; do
+    m1_left pair "$m1_rc" false
+    [ "$M1_PART$M1_CTL" = yy ] && pass "M1 aria2c rc $m1_rc (transient): pair kept" \
+      || fail "M1 aria2c rc $m1_rc: pair not kept (part=$M1_PART ctl=$M1_CTL)"
+done
+for m1_rc in 1 8 28 153; do
+    m1_left pair "$m1_rc" false
+    [ "$M1_PART$M1_CTL" = nn ] && pass "M1 aria2c rc $m1_rc (not transient): pair dropped" \
+      || fail "M1 aria2c rc $m1_rc: pair not dropped (part=$M1_PART ctl=$M1_CTL)"
+done
+# rc 0 with an empty .part reaches the failure branch too: dropped.
+rm -f "$DL_TMP" "$DL_TMP.aria2"; printf 'ctl' > "$DL_TMP.aria2"; : > "$DL_TMP"
+ARIA_CONTENT="" STUB_ARIA_RC=0 ALLOW_UNVERIFIED=false YES_TO_ALL=true MIRROR_SCHEME=https SIZE_CL=100 \
   EFFECTIVE_URL="https://m.invalid/f.zim" \
   download_file "https://lb.download.kiwix.org/zim/x/m1out.zim" "$WORK_DIR/m1out.zim" >/dev/null 2>&1
-{ [ "$(cat "$M1_SEEN")" = end ] && [ ! -e "$DL_TMP" ] && [ ! -e "$DL_TMP.aria2" ]; } \
-  && pass "M1 leftover .part and .part.aria2 are gone before aria2c starts (and after it fails)" \
-  || fail "M1 leftover temp files: seen-at-start='$(tr '\n' ' ' < "$M1_SEEN")' part=$([ -e "$DL_TMP" ]&&echo y||echo n) ctl=$([ -e "$DL_TMP.aria2" ]&&echo y||echo n)"
+{ [ ! -e "$DL_TMP" ] && [ ! -e "$DL_TMP.aria2" ]; } \
+  && pass "M1 aria2c rc 0 with an empty .part: pair dropped" \
+  || fail "M1 aria2c rc 0 empty: part=$([ -e "$DL_TMP" ]&&echo y||echo n) ctl=$([ -e "$DL_TMP.aria2" ]&&echo y||echo n)"
+rm -f "$DL_TMP" "$DL_TMP.aria2"
 
 # --- Definitive hash-mismatch (200 + wrong hash -> rc 1): discard + re-download -
 : > "$ARIA_LOG"; rm -f "$WORK_DIR/m1out.zim" "$DL_TMP"
@@ -590,6 +604,88 @@ n_aria=$(grep -c 'aria2c ' "$ARIA_LOG")
 [ ! -f "$DL_TMP" ] && pass "M1 definitive: .part discarded (definitive => not kept)" || fail "M1 definitive: .part survived a definitive failure"
 [ ! -f "$WORK_DIR/m1out.zim" ] && pass "M1 definitive: nothing installed" || fail "M1 definitive: a mismatched file was installed"
 MAX_RETRIES=1   # restore the harness default so later groups are unaffected
+
+# ======================================================================
+echo; echo "########## RP — resumable-partial helpers ##########"
+# Unit checks of _resumable_pair / _partial_alloc_bytes / _prune_temp_dir against
+# a scratch TEMP_DIR (the shared one is restored afterwards).
+RP_SAVED_TEMP="$TEMP_DIR"; TEMP_DIR="$ROOT/rp/temp"; mkdir -p "$TEMP_DIR" "$ROOT/rp/outside"
+RP="$TEMP_DIR/a.zim.part"
+head -c 8192 /dev/urandom > "$RP"; : > "$RP.aria2"
+ALLOW_UNVERIFIED=false _resumable_pair "$RP" && pass "RP pair: regular .part + .part.aria2 is resumable" || fail "RP pair not resumable"
+ALLOW_UNVERIFIED=true _resumable_pair "$RP" && fail "RP pair resumable under --allow-unverified" || pass "RP pair: never resumable under --allow-unverified"
+rm -f "$RP.aria2"
+ALLOW_UNVERIFIED=false _resumable_pair "$RP" && fail "RP .part alone counted resumable" || pass "RP .part without .part.aria2: not resumable"
+ln -s "$ROOT/rp/outside/ctl" "$RP.aria2"; : > "$ROOT/rp/outside/ctl"
+ALLOW_UNVERIFIED=false _resumable_pair "$RP" && fail "RP symlinked .aria2 counted resumable" || pass "RP symlinked .part.aria2: not resumable"
+rm -f "$RP.aria2"; : > "$RP.aria2"
+# A .part hard-linked elsewhere, or not owned by the expected uid, must not be
+# resumed (aria2c would write into it and it would be renamed into place).
+ln "$RP" "$ROOT/rp/outside/hardlink"
+ALLOW_UNVERIFIED=false _resumable_pair "$RP" && fail "RP hard-linked .part counted resumable" || pass "RP hard-linked .part: not resumable"
+rm -f "$ROOT/rp/outside/hardlink"
+EXPECTED_OWNER_UID=999999 ALLOW_UNVERIFIED=false _resumable_pair "$RP" && fail "RP foreign-owned pair counted resumable" || pass "RP pair not owned by the expected uid: not resumable"
+# Mirror Content-Length reaches $(( )): a leading 0 must not be read as octal
+# ("08" was a fatal arithmetic error aborting the run) and huge values must not wrap.
+rp_sz=$(SIZE_CL=08 MIRROR_SCHEME=https get_remote_size "https://lb.download.kiwix.org/zim/x/a.zim") \
+  && [ "$rp_sz" = 8 ] && pass "RP get_remote_size: Content-Length 08 read as decimal 8" || fail "RP get_remote_size 08: '$rp_sz'"
+SIZE_CL=99999999999999999999 MIRROR_SCHEME=https get_remote_size "https://lb.download.kiwix.org/zim/x/a.zim" >/dev/null \
+  && fail "RP get_remote_size accepted a 20-digit Content-Length" || pass "RP get_remote_size: oversized Content-Length rejected"
+
+rp_expect=$(( $(stat -c '%b' "$RP") * $(stat -c '%B' "$RP") ))
+rp_got=$(ALLOW_UNVERIFIED=false _partial_alloc_bytes "$WORK_DIR/a.zim")
+{ [ "$rp_got" = "$rp_expect" ] && [ "$rp_got" -gt 0 ]; } && pass "RP alloc bytes = allocated size of the .part ($rp_got)" || fail "RP alloc bytes: got '$rp_got' expected '$rp_expect'"
+rp_got=$(ALLOW_UNVERIFIED=true _partial_alloc_bytes "$WORK_DIR/a.zim")
+[ "$rp_got" = 0 ] && pass "RP alloc bytes = 0 under --allow-unverified" || fail "RP alloc bytes under --allow-unverified: '$rp_got'"
+rp_got=$(ALLOW_UNVERIFIED=false _partial_alloc_bytes "$WORK_DIR/none.zim")
+[ "$rp_got" = 0 ] && pass "RP alloc bytes = 0 with no partial" || fail "RP alloc bytes with no partial: '$rp_got'"
+stat(){ echo 'x y'; }
+rp_got=$(ALLOW_UNVERIFIED=false _partial_alloc_bytes "$WORK_DIR/a.zim")
+unset -f stat
+[ "$rp_got" = 0 ] && pass "RP alloc bytes = 0 when stat output is not numeric" || fail "RP alloc bytes on garbage stat: '$rp_got'"
+
+# _prune_temp_dir: recent pair kept; stale pair, orphans, other files,
+# symlinks (target untouched) and subdirectories removed.
+touch -d '20 days ago' "$TEMP_DIR/a.zim.part"   # .part age is irrelevant
+: > "$TEMP_DIR/old.zim.part"; : > "$TEMP_DIR/old.zim.part.aria2"; touch -d "$((PARTIAL_MAX_AGE_DAYS + 1)) days ago" "$TEMP_DIR/old.zim.part.aria2"
+: > "$TEMP_DIR/orphan.zim.part"; : > "$TEMP_DIR/lonectl.zim.part.aria2"
+: > "$TEMP_DIR/a.zim.meta4"; : > "$TEMP_DIR/a.zim.part.err"
+: > "$TEMP_DIR/sl.zim.part"; ln -s "$ROOT/rp/outside/ctl" "$TEMP_DIR/sl.zim.part.aria2"
+ln -s "$ROOT/rp/outside/ctl" "$TEMP_DIR/link"
+mkdir -p "$TEMP_DIR/sub.zim.part"; : > "$TEMP_DIR/sub.zim.part/x"; : > "$TEMP_DIR/sub.zim.part.aria2"
+_prune_temp_dir
+rp_left=$(find "$TEMP_DIR" -mindepth 1 -printf '%f\n' | sort | tr '\n' ' ')
+[ "$rp_left" = "a.zim.part a.zim.part.aria2 " ] \
+  && pass "RP prune: only the recent regular pair survives (stale pair, orphans, .meta4/.err, symlinks, subdir removed)" \
+  || fail "RP prune left: '$rp_left'"
+[ -f "$ROOT/rp/outside/ctl" ] && pass "RP prune: a symlink's target outside TEMP_DIR is untouched" || fail "RP prune followed a symlink"
+rm -rf "$TEMP_DIR"; _prune_temp_dir && pass "RP prune: missing TEMP_DIR is a no-op (rc 0)" || fail "RP prune: non-zero rc on missing TEMP_DIR"
+
+# clean_state prunes (run path); clean_state full (the clean command) wipes.
+# In a subshell on a scratch WORK_DIR so the harness state files are untouched.
+rp_clean(){ # $1 = clean_state arg -> listing of the scratch TEMP_DIR ("gone" if removed)
+    ( WORK_DIR="$ROOT/rp/wd"; TEMP_DIR="$WORK_DIR/temp"; STATUS_FILE="$WORK_DIR/status"
+      LIBRARY_CACHE="$WORK_DIR/.cache"; mkdir -p "$TEMP_DIR"
+      : > "$TEMP_DIR/k.zim.part"; : > "$TEMP_DIR/k.zim.part.aria2"; : > "$TEMP_DIR/o.zim.part"
+      clean_state "$@" >/dev/null 2>&1
+      if [ -d "$TEMP_DIR" ]; then find "$TEMP_DIR" -mindepth 1 -printf '%f\n' | sort | tr '\n' ' '; else echo gone; fi )
+}
+rp_left=$(rp_clean)
+[ "$rp_left" = "k.zim.part k.zim.part.aria2 " ] && pass "RP clean_state keeps the resumable pair, drops the orphan" || fail "RP clean_state left: '$rp_left'"
+rp_left=$(rp_clean full)
+[ "$rp_left" = gone ] && pass "RP clean_state full removes TEMP_DIR, partials included" || fail "RP clean_state full left: '$rp_left'"
+# _drop_dead_partials keeps the partial of every offered file (queued or not)
+# and removes only the others.
+rm -rf "$TEMP_DIR"; mkdir -p "$TEMP_DIR"
+: > "$TEMP_DIR/live.zim.part"; : > "$TEMP_DIR/live.zim.part.aria2"
+: > "$TEMP_DIR/dead.zim.part"; : > "$TEMP_DIR/dead.zim.part.aria2"
+: > "$TEMP_DIR/sk_2025-06.zim.part"; : > "$TEMP_DIR/sk_2025-06.zim.part.aria2"
+: > "$TEMP_DIR/sk_maxi_2025-06.zim.part"; : > "$TEMP_DIR/sk_maxi_2025-06.zim.part.aria2"   # another flavour: not protected by stem sk
+_drop_dead_partials "live.zim.part" "other.zim.part" "$(_zim_stem sk_2025-01.zim)" >/dev/null
+rp_left=$(find "$TEMP_DIR" -mindepth 1 -printf '%f\n' | sort | tr '\n' ' ')
+[ "$rp_left" = "live.zim.part live.zim.part.aria2 sk_2025-06.zim.part sk_2025-06.zim.part.aria2 " ] \
+  && pass "RP _drop_dead_partials keeps offered and skipped-stem partials, removes the rest" || fail "RP _drop_dead_partials left: '$rp_left'"
+TEMP_DIR="$RP_SAVED_TEMP"
 
 # ======================================================================
 echo; echo "########## C1 — SHA-256 integrity: happy / mismatch / no-hash-block ##########"
@@ -791,6 +887,201 @@ m8_run "m8n_2025-08.zim" "m8n_2025-09.zim" 40 newer
 m8_run "m8n2_2025-08.zim" "m8n2_2025-09.zim" 60 newer
 [ "$M8_HIT" = yes ] && pass "M8 newer: newer catalog + ratio 60>=50 => Update needed (flagged)" || fail "M8 newer: 60% not flagged"
 UPDATE_CRITERIA=all   # restore the harness global (leak is bidirectional)
+
+# ======================================================================
+echo; echo "########## R — resumable partials through the REAL main (run_main.sh) ##########"
+# Each run is a separate `main` process (lib/run_main.sh), so main's clean_state
+# at start and cleanup at exit act on TEMP_DIR exactly as in production. Seeds
+# and assertions use only the child-side paths RT/RS/RL/RLOG. Every case that
+# expects a download also requires ARIA_LOG to be non-empty, so a run stopped at
+# an earlier gate fails instead of passing vacuously.
+R_PART="$RT/$RM_NEW.part"
+R_PAYLOAD="resume-e2e-payload"
+R_SHA=$(printf '%s' "$R_PAYLOAD" | sha256sum | awk '{print $1}')
+R_SIZE=1048576   # catalog size: the cap it implies (~1 MiB) leaves room for the stub's own log writes
+R_CAT="$ROOT/r_feed.xml"; rm_feed "$R_CAT" "$R_SIZE"
+R_OUT="$ROOT/r.out"
+
+# r_go ARGV…: one main run. Per-case knobs (STUB_ARIA_*, STUB_DF_AVAIL, RM_PRE,
+# R_CAT/R_SIZE/R_SHA overrides) go as env prefixes on the call.
+r_go(){
+    CATALOG="$R_CAT" SIZE_CL="$R_SIZE" EFFECTIVE_URL="https://m.invalid/$RM_NEW" MIRROR_SCHEME=https \
+      CURL_RESOLVE_FAIL=0 META4_CODE=200 META4_EXIT=0 META4_BODY="<hash type=\"sha-256\">$R_SHA</hash>" \
+      ARIA_CONTENT="$R_PAYLOAD" "$ROOT/run_main.sh" "$@" > "$R_OUT" 2>&1
+}
+# r_go_bg ARGV…: the same, as its own process group (setsid execs in place: the
+# suite is not a group leader), in the background; sets R_PID.
+r_go_bg(){
+    CATALOG="$R_CAT" SIZE_CL="$R_SIZE" EFFECTIVE_URL="https://m.invalid/$RM_NEW" MIRROR_SCHEME=https \
+      CURL_RESOLVE_FAIL=0 META4_CODE=200 META4_EXIT=0 META4_BODY="<hash type=\"sha-256\">$R_SHA</hash>" \
+      ARIA_CONTENT="$R_PAYLOAD" setsid "$ROOT/run_main.sh" "$@" > "$R_OUT" 2>&1 &
+    R_PID=$!
+}
+r_has(){ if [ -e "$1" ] || [ -L "$1" ]; then echo y; else echo n; fi; }
+r_pair(){ echo "$(r_has "$R_PART")$(r_has "$R_PART.aria2")"; }
+r_ran(){ [ -s "$ARIA_LOG" ]; }
+r_why(){ echo "aria2c calls=$(grep -c '^aria2c ' "$ARIA_LOG") $(grep -o 'aria2c exit [0-9]*' "$RLOG" 2>/dev/null | head -n 1) log tail:$(tail -n 3 "$RLOG" 2>/dev/null | tr '\n' ' ' | head -c 300)"; }
+# r_dense_pair BYTES: seed the target's pair with a fully allocated .part (random
+# bytes, so no filesystem stores it sparse or compressed); echoes its allocated
+# size as stat reports it, the figure the script credits.
+r_dense_pair(){
+    mkdir -m 755 "$RT"   # reset_case removed it
+    head -c "$1" /dev/urandom > "$R_PART"; : > "$R_PART.aria2"
+    local b s; read -r b s < <(stat -c '%b %B' "$R_PART"); echo $(( b * s ))
+}
+
+if [ -n "${SKIP_E2E:-}" ]; then
+    echo "SKIP: R cases (SKIP_E2E=${SKIP_E2E}) — end-to-end resume coverage NOT run"
+elif [ -n "$RM_TRUST_ERR" ]; then
+    fail "R cases not run: $RM_TRUST_ERR"
+else
+# --- R1: a pair left by a failed run is resumed by the NEXT run -----------------
+reset_case
+STUB_ARIA_PARTIAL=1 STUB_ARIA_RC=7 r_go smart-update -y
+r1_ran=n; r_ran && r1_ran=y
+r1_between=$(r_pair)
+: > "$ARIA_PREEXIST_LOG"; : > "$ARIA_LOG"
+r_go smart-update -y
+r1_seen=$(tr '\n' ' ' < "$ARIA_PREEXIST_LOG")
+{ [ "$r1_ran" = y ] && [ "$r1_between" = yy ] && [ "$r1_seen" = "part ctl end " ] && grep -q "Resuming $RM_NEW" "$RLOG"; } \
+  && pass "R1 cross-run: run 1 (rc 7) keeps the pair; run 2 hands it to aria2c and logs Resuming" \
+  || fail "R1 cross-run: run1 ran=$r1_ran pair-between=$r1_between run2 seen='$r1_seen'; $(r_why)"
+# Resume must come from the control file alone: --continue would let aria2c
+# append to a .part whose control file is gone (wrong content, right size).
+! grep -q -- '--continue' "$ARIA_LOG" && pass "R1 aria2c is never passed --continue" || fail "R1 aria2c was passed --continue"
+{ [ -f "$KIWIX_WORK_DIR/$RM_NEW" ] && [ ! -e "$KIWIX_WORK_DIR/$RM_OLD" ] && [ "$(r_pair)" = nn ]; } \
+  && pass "R1 cross-run: resumed download installs and leaves no partial" \
+  || fail "R1 cross-run install: new=$(r_has "$KIWIX_WORK_DIR/$RM_NEW") old=$(r_has "$KIWIX_WORK_DIR/$RM_OLD") pair=$(r_pair)"
+
+# --- R2: failure policy survives main (the stub always writes a pair) -----------
+# The full return-code table is covered at unit level in M1; here one keep, one
+# drop and the --allow-unverified override, end to end.
+r2(){ # $1=rc $2=expected pair state (yy kept / nn dropped) $3=label, rest = extra main args
+    local rc="$1" want="$2" label="$3"; shift 3
+    reset_case
+    STUB_ARIA_PARTIAL=1 STUB_ARIA_RC="$rc" r_go smart-update -y "$@"
+    local got; got=$(r_pair)
+    { r_ran && [ "$got" = "$want" ]; } && pass "R2 aria2c rc $rc$label: pair $( [ "$want" = yy ] && echo kept || echo dropped) after main exits" \
+      || fail "R2 aria2c rc $rc$label: pair=$got (want $want); $(r_why)"
+}
+r2 7 yy ""
+r2 8 nn ""
+r2 7 nn " --allow-unverified" --allow-unverified
+
+# --- R2b: in-run retry resumes the pair the first attempt left ------------------
+reset_case
+RM_PRE="$RM_DEFAULT; MAX_RETRIES=2" STUB_ARIA_PARTIAL=1 STUB_ARIA_RC_SEQ="7 0" r_go smart-update -y
+r2b_seen=$(tr '\n' ' ' < "$ARIA_PREEXIST_LOG")
+{ [ "$r2b_seen" = "end part ctl end " ] && [ -f "$KIWIX_WORK_DIR/$RM_NEW" ]; } \
+  && pass "R2b in-run retry: attempt 2 sees the pair attempt 1 left (rc 7), then installs" \
+  || fail "R2b in-run retry: seen='$r2b_seen' installed=$(r_has "$KIWIX_WORK_DIR/$RM_NEW"); $(r_why)"
+
+# --- R3: pruning (all seeded names differ from the run's own target) ------------
+reset_case; mkdir -m 755 "$RT"
+: > "$RT/z_2020-01.zim.part"; : > "$RT/z_2020-01.zim.part.aria2"
+r_go clean
+{ [ ! -e "$RT/z_2020-01.zim.part" ] && [ ! -e "$RT/z_2020-01.zim.part.aria2" ]; } \
+  && pass "R3 clean: discards a resumable pair" \
+  || fail "R3 clean left: $(ls -A "$RT" 2>/dev/null | tr '\n' ' ')"
+# The prune's per-entry rules (orphans, symlinks, subdirectories) are unit-tested
+# in RP; here only that a real run keeps a fresh pair and drops a stale one.
+reset_case; mkdir -m 755 "$RT"
+: > "$RT/z_2020-01.zim.part"; : > "$RT/z_2020-01.zim.part.aria2"                 # fresh pair
+: > "$RT/s_2020-01.zim.part"; : > "$RT/s_2020-01.zim.part.aria2"
+touch -d "$((PARTIAL_MAX_AGE_DAYS + 1)) days ago" "$RT/s_2020-01.zim.part.aria2"  # stale pair
+r_go smart-update -y
+r3_left=$(find "$RT" -mindepth 1 -maxdepth 1 -name '[zs]_2020-01*' -printf '%f\n' 2>/dev/null | sort | tr '\n' ' ')
+{ r_ran && [ "$r3_left" = "z_2020-01.zim.part z_2020-01.zim.part.aria2 " ]; } \
+  && pass "R3 run prune: fresh pair kept, $((PARTIAL_MAX_AGE_DAYS + 1))-day-old pair removed" \
+  || fail "R3 run prune left: '$r3_left'; $(r_why)"
+
+# --- R4: SIGTERM mid-download: the pair survives and cleanup still runs ---------
+reset_case
+r4_started="$ROOT/r4.started"; rm -f "$r4_started"
+STUB_ARIA_BLOCK="$r4_started" r_go_bg smart-update -y
+r4_ok=false
+for _ in $(seq 100); do [ -e "$r4_started" ] && { r4_ok=true; break; }; "$REAL_SLEEP" 0.1; done
+if $r4_ok && [ "$(ps -o pgid= -p "$R_PID" | tr -d ' ')" = "$R_PID" ]; then
+    r4_rs=$(r_has "$RS")
+    : > "$RT/x.meta4"
+    kill -TERM -- -"$R_PID"
+    wait "$R_PID"; r4_rc=$?
+    { [ "$r4_rs" = y ] && [ "$r4_rc" -eq 143 ] && [ "$(r_pair)" = yy ] && [ ! -e "$RS" ] && [ ! -e "$RT/x.meta4" ]; } \
+      && pass "R4 SIGTERM: pair kept for resume; cleanup ran (status file and .meta4 removed, exit 143)" \
+      || fail "R4 SIGTERM: status-before=$r4_rs rc=$r4_rc pair=$(r_pair) status-after=$(r_has "$RS") meta4=$(r_has "$RT/x.meta4")"
+else
+    kill -KILL -- -"$R_PID" 2>/dev/null || kill -KILL "$R_PID" 2>/dev/null
+    wait "$R_PID"
+    fail "R4 SIGTERM: aria2c never started or the run is not its own process group (started=$r4_ok); $(r_why)"
+fi
+
+# --- R5: disk-space gates credit the bytes a resumable partial already holds ----
+# remote R = A + 8 MiB, free F = R - A/2: enough only with the partial's credit.
+reset_case
+r5_a=$(r_dense_pair $((16 * 1024 * 1024)))
+if [ "$r5_a" -lt $((8 * 1024 * 1024)) ]; then
+    fail "R5 setup: partial allocates only $r5_a bytes (filesystem stores it sparse?)"
+else
+    r5_r=$(( r5_a + 8 * 1024 * 1024 )); r5_f=$(( r5_r - r5_a / 2 ))
+    R5_CAT="$ROOT/r5_feed.xml"; rm_feed "$R5_CAT" "$r5_r"
+    r5(){ R_CAT="$R5_CAT" R_SIZE="$r5_r" STUB_DF_AVAIL="$r5_f" r_go smart-update -y "$@"; }
+    r5
+    { r_ran && ! grep -qE 'Not enough free space|Insufficient disk space' "$RLOG"; } \
+      && pass "R5 pair present: free < remote but >= remote - partial passes both space gates (download runs)" \
+      || fail "R5 pair present: refused; $(r_why)"
+    reset_case; r_dense_pair $((16 * 1024 * 1024)) >/dev/null; rm -f "$R_PART.aria2"
+    r5
+    { ! r_ran && grep -q 'Not enough free space for updates' "$RLOG"; } \
+      && pass "R5 orphan .part (no control file): pruned at run start, earns no credit, refused at the analyze gate" \
+      || fail "R5 orphan .part: not refused at the analyze gate; $(r_why)"
+    reset_case; r_dense_pair $((16 * 1024 * 1024)) >/dev/null
+    r5 --allow-unverified
+    { ! r_ran && grep -q 'Not enough free space for updates' "$RLOG"; } \
+      && pass "R5 pair under --allow-unverified: no credit, refused at the analyze gate" \
+      || fail "R5 --allow-unverified: not refused at the analyze gate; $(r_why)"
+    # Refused although the target's own partial IS credited (free too small even
+    # with it): the queued file's partial is kept, not discarded to make room.
+    reset_case; r_dense_pair $((16 * 1024 * 1024)) >/dev/null
+    R_CAT="$R5_CAT" R_SIZE="$r5_r" STUB_DF_AVAIL=$(( r5_r - r5_a - 1024 * 1024 )) r_go smart-update -y
+    { ! r_ran && grep -q 'Not enough free space for updates' "$RLOG" && [ "$(r_pair)" = yy ]; } \
+      && pass "R5 refused with only the credited partial: the queued file's partial is kept" \
+      || fail "R5 credited partial: not refused, or the queued partial was discarded; pair=$(r_pair); $(r_why)"
+fi
+
+# --- R6: a partial of a version the catalog no longer offers is discarded when
+# space is short, instead of refusing every run until the age prune.
+r6_seed(){
+    reset_case; mkdir -m 755 "$RT"
+    r6_old="$RT/X_2025-12.zim.part"
+    head -c $((16 * 1024 * 1024)) /dev/urandom > "$r6_old"; : > "$r6_old.aria2"
+}
+r6_r=$((8 * 1024 * 1024))
+R6_CAT="$ROOT/r6_feed.xml"; rm_feed "$R6_CAT" "$r6_r"
+# Free space with the old partial present is below what the update needs; with
+# it gone (df subtracts the partials in RT) it fits.
+r6(){ R_CAT="$R6_CAT" R_SIZE="$r6_r" STUB_DF_AVAIL=$(( r6_r + 1024 * 1024 )) STUB_DF_PARTS_DIR="$RT" r_go "$@"; }
+r6_seed; r6 smart-update -y
+{ r_ran && [ ! -e "$r6_old" ] && [ ! -e "$r6_old.aria2" ] && grep -q 'Discarded partial downloads of files the catalog no longer offers' "$RLOG"; } \
+  && pass "R6 space short: a partial of a version no longer offered is discarded and the update proceeds" \
+  || fail "R6 self-heal: old=$(r_has "$r6_old"); $(r_why)"
+# A local file the catalog does not match (skipped: retired, custom, or a
+# transient glitch) keeps its partial, and does not stop the dead one going.
+r6_seed
+head -c 1024 /dev/urandom > "$KIWIX_WORK_DIR/Y_2025-01.zim"
+r6_y="$RT/Y_2025-06.zim.part"
+head -c $((1024 * 1024)) /dev/urandom > "$r6_y"; : > "$r6_y.aria2"
+R_CAT="$R6_CAT" R_SIZE="$r6_r" STUB_DF_AVAIL=$(( r6_r + 3 * 1024 * 1024 )) STUB_DF_PARTS_DIR="$RT" r_go smart-update -y
+{ r_ran && [ ! -e "$r6_old" ] && [ -e "$r6_y" ] && [ -e "$r6_y.aria2" ]; } \
+  && pass "R6 skipped file's partial kept; the dead partial is still discarded and the update proceeds" \
+  || fail "R6 skipped: old=$(r_has "$r6_old") y=$(r_has "$r6_y"); $(r_why)"
+rm -f "$KIWIX_WORK_DIR/Y_2025-01.zim"
+# check-updates only reports: it never discards a partial, even when space is short.
+r6_seed; r6 check-updates
+{ [ -e "$r6_old" ] && [ -e "$r6_old.aria2" ] && ! grep -q 'Discarded partial downloads' "$RLOG"; } \
+  && pass "R6 check-updates keeps every partial even when space is short" \
+  || fail "R6 check-updates discarded a partial; old=$(r_has "$r6_old"); $(r_why)"
+
+fi   # RM_TRUST_ERR
 
 # ======================================================================
 if [ "${KIWIX_LIVE:-0}" = 1 ]; then

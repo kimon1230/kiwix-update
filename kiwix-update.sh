@@ -8,6 +8,7 @@
 WORK_DIR="${KIWIX_WORK_DIR:-/var/local/zims}" # where your .zim files live (override: KIWIX_WORK_DIR)
 ZIM_LIBRARY="${KIWIX_ZIM_LIBRARY:-/var/local/library_zim.xml}" # library_zim.xml (override: KIWIX_ZIM_LIBRARY)
 TEMP_DIR="${WORK_DIR}/temp"
+PARTIAL_MAX_AGE_DAYS=14   # resumable partial downloads untouched this long are pruned
 BACKUP_DIR="${WORK_DIR}/backups"
 LOG_FILE="${WORK_DIR}/kiwix_update.log"
 STATUS_FILE="${WORK_DIR}/.kiwix_update_status"
@@ -685,7 +686,7 @@ cleanup() {
     fi
     # Never leave kiwix-serve down because the run ended (or was signalled) after
     # stopping it: the .kiwix_was_running marker is the single record of that, and
-    # restore is a no-op without it. Restore before removing TEMP_DIR so a slow
+    # restore is a no-op without it. Restore before pruning TEMP_DIR so a slow
     # rm -rf cannot delay the service. A no-op handler (NOT trap '': SIG_IGN is
     # inherited across exec, so systemctl/service and a sysvinit-started
     # kiwix-serve would ignore SIGTERM) keeps a second Ctrl-C from aborting the
@@ -695,9 +696,9 @@ cleanup() {
         restore_service_if_managed
     fi
 
-    # Clean up transient files if not in background mode
+    # Clean up transient files if not in background mode (resumable partials stay)
     if [ -z "${KIWIX_BACKGROUND:-}" ]; then
-        [ -d "${TEMP_DIR}" ] && rm -rf "${TEMP_DIR}"
+        _prune_temp_dir
         [ -f "${STATUS_FILE}" ] && rm -f "${STATUS_FILE}"
     fi
 
@@ -717,7 +718,8 @@ Commands:
                         (entries for ZIMs outside the directory are left alone)
    status               Show current update status
    stop                 Stop a running update process
-   clean                Remove all logs and state files
+   clean                Remove all logs and state files, and discard partial
+                        downloads (otherwise kept to resume on the next run)
    help                 Show this help message
 
 Options:
@@ -1067,8 +1069,11 @@ get_remote_size() {
     # at an internal/link-local/metadata host (SSRF); one hop can only be steered
     # by the TLS-authenticated kiwix.org LB.
     if size=$(curl -sLI --proto "$proto" --proto-redir "$proto" --max-redirs 1 --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" --fail -- "$url" | grep -i content-length | tail -n1 | awk '{print $2}' | tr -d '\r'); then
-        if [[ "$size" =~ ^[0-9]+$ ]]; then
-            echo "$size"
+        # Mirror-supplied (possibly over HTTP) and used in $(( )): bound the
+        # digits (no 64-bit wrap) and force base 10 (a leading 0 is octal in
+        # bash, and "08" is a fatal arithmetic error that aborts the run).
+        if [[ "$size" =~ ^[0-9]{1,15}$ ]]; then
+            echo $(( 10#$size ))
             return 0
         fi
     fi
@@ -1246,6 +1251,100 @@ _aria2c_capped() {
     fi
 }
 
+# A partial is the pair X.part + X.part.aria2 (aria2c's control file), both
+# regular files and neither a symlink.
+_is_pair() {
+    local f
+    for f in "$1" "$1.aria2"; do
+        [ -f "$f" ] && [ ! -L "$f" ] || return 1
+        # Ours and singly linked: a .part that predates the trust gate (foreign
+        # owner) or is hard-linked elsewhere must not be written into by aria2c
+        # and renamed into place as the served .zim.
+        [ "$(stat -c '%u %h' -- "$f" 2>/dev/null)" = "${EXPECTED_OWNER_UID} 1" ] || return 1
+    done
+}
+
+# A pair this run may resume. Never under --allow-unverified: with only a size
+# check left, a spliced or foreign .part could pass verification.
+_resumable_pair() {
+    ! ${ALLOW_UNVERIFIED} && _is_pair "$1"
+}
+
+# Bytes already allocated on disk by a resumable partial of $1 (the final .zim
+# path), else 0. Allocated, not apparent: partials are sparse. Always prints one
+# integer and returns 0 (callers run under set -e and do arithmetic on it).
+_partial_alloc_bytes() {
+    local part="${TEMP_DIR}/$(basename "$1").part"
+    local blocks="" bsize=""
+    if _resumable_pair "$part"; then
+        read -r blocks bsize < <(stat -c '%b %B' -- "$part" 2>/dev/null) || true
+    fi
+    if [[ "$blocks" =~ ^[0-9]+$ ]] && [[ "$bsize" =~ ^[0-9]+$ ]]; then
+        echo $(( 10#$blocks * 10#$bsize ))
+    else
+        echo 0
+    fi
+}
+
+# Empty TEMP_DIR except recent partials: a *.zim.part pair (_is_pair) whose
+# control file is under PARTIAL_MAX_AGE_DAYS old is kept (both halves); orphans,
+# metalinks, .err files, symlinks and subdirectories are removed. Deliberately
+# ignores --allow-unverified, so such a run leaves other files' partials for the
+# next verified run. find without -L does not descend a symlinked TEMP_DIR.
+# Always returns 0 (runs from cleanup/clean_state under set -e).
+_prune_temp_dir() {
+    [ -d "${TEMP_DIR}" ] || return 0
+    local entry part
+    while IFS= read -r -d '' entry; do
+        case "$entry" in
+            *.zim.part) part="$entry" ;;
+            *.zim.part.aria2) part="${entry%.aria2}" ;;
+            *) part="" ;;
+        esac
+        if [ -n "$part" ] && _is_pair "$part" &&
+            [ -n "$(find "$part.aria2" -maxdepth 0 -mtime "-${PARTIAL_MAX_AGE_DAYS}" 2>/dev/null)" ]; then
+            continue
+        fi
+        rm -rf -- "$entry" 2>/dev/null || true
+    done < <(find "${TEMP_DIR}" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    return 0
+}
+
+# Undated stem of a .zim name, as find_latest_zim matches it: X_2025-01.zim -> X.
+_zim_stem() {
+    local stem="${1%.zim}"
+    [[ "$stem" =~ ^(.+)_[0-9]{4}-[0-9]{2}$ ]] && stem="${BASH_REMATCH[1]}"
+    printf '%s' "$stem"
+}
+
+# Space is short: discard partials of files the catalog no longer offers (e.g.
+# a version it has since replaced). They can never resume, yet would otherwise
+# refuse every run until pruned by age. Each argument protects partials:
+# <name>.zim.part of a file the catalog offers (exact), or the stem of a local
+# file skipped this run (<stem>.zim.part, <stem>_YYYY-MM.zim.part), so a
+# transient catalog glitch does not cost a skipped file its progress (except a
+# title find_latest_zim maps to an alias name, e.g. wikihow_en_maxi; at worst a
+# re-download). Echoes bytes freed.
+_drop_dead_partials() {
+    local part base keep alive blocks freed=0
+    while IFS= read -r -d '' part; do
+        base=$(basename "$part")
+        alive=false
+        for keep in "$@"; do
+            case "$base" in
+                "$keep"|"$keep.zim.part"|"$keep"_[0-9][0-9][0-9][0-9]-[0-9][0-9].zim.part) alive=true; break ;;
+            esac
+        done
+        if $alive; then continue; fi
+        blocks=$(stat -c '%b' -- "$part" 2>/dev/null) || blocks=0
+        [[ "$blocks" =~ ^[0-9]+$ ]] || blocks=0
+        if rm -f -- "$part" "$part.aria2"; then
+            freed=$(( freed + blocks * 512 ))
+        fi
+    done < <(find "${TEMP_DIR}" -maxdepth 1 -type f -name '*.zim.part' -print0 2>/dev/null)
+    echo "$freed"
+}
+
 download_file() {
     local url="$1"
     local output="$2"
@@ -1263,11 +1362,17 @@ download_file() {
 
     mkdir -p "${TEMP_DIR}" || return 1
 
-    # Always start from a clean temp file. aria2c resumes from a leftover
-    # .aria2 control file on its own, and a stale or foreign temp file can
-    # become a correct-size, wrong-content payload that size-only verification
-    # accepts — so both are removed before every download.
-    rm -f -- "$temp_file" "$temp_file.aria2"
+    # Resume an interrupted download: aria2c resumes from the .part only when its
+    # .aria2 control file is present. --continue is never passed, so without the
+    # control file aria2c restarts from 0 and a stale or foreign .part is never
+    # blindly appended to. Under --allow-unverified (size-only verification) or
+    # with an incomplete pair, start clean. A kept pair that hits an early return
+    # below (resolve failure, mirror size, user decline) waits for the next run.
+    if _resumable_pair "$temp_file"; then
+        log "INFO" "Resuming ${filename} ($(numfmt --to=iec-i --suffix=B "$(_partial_alloc_bytes "$output")") already on disk)"
+    else
+        rm -f -- "$temp_file" "$temp_file.aria2"
+    fi
 
     # Confirm download if not auto-yes
     if ! ${YES_TO_ALL}; then
@@ -1390,13 +1495,15 @@ download_file() {
     else
         # Unknown catalog size: bound by free space, reserving a margin (the
         # smaller of 512 MiB or 10% of free) so a hostile unbounded stream can
-        # never drive the disk to 0 — even when free space is already low.
-        local free_kib reserve_kib
+        # never drive the disk to 0 — even when free space is already low. The
+        # cap bounds the whole file, so a resumed partial's bytes count toward it.
+        local free_kib reserve_kib alloc_kib
         free_kib=$(( $(get_free_space) / 1024 ))
         if [ "$free_kib" -gt 0 ]; then
             reserve_kib=$(( 512 * 1024 ))
             [ "$reserve_kib" -gt $(( free_kib / 10 )) ] && reserve_kib=$(( free_kib / 10 ))
-            fcap_kib=$(( free_kib - reserve_kib ))
+            alloc_kib=$(( $(_partial_alloc_bytes "$output") / 1024 ))
+            fcap_kib=$(( free_kib + alloc_kib - reserve_kib ))
         fi
         # df unreadable (free_kib=0) or the subtraction non-positive: fall back to
         # a large absolute ceiling that exceeds any real .zim (~110 GiB max) yet
@@ -1484,7 +1591,19 @@ download_file() {
             while IFS= read -r aria_line; do
                 log "ERROR" "aria2c: ${aria_line}"
             done < "$aria_err"
-            rm -f -- "$temp_file" "$temp_file.aria2"
+            # Keep the pair for resuming only after a transient failure (2 timeout,
+            # 6 network, 7 interrupted, 19 DNS, 29 server busy, or a signal other
+            # than SIGXFSZ=153). Anything else (1 e.g. remote size changed, 8 no
+            # Range support, 28 bad option, cap overflow, rc 0 with no data) would
+            # fail the same way again, so start over.
+            local keep=false
+            case "$aria_rc" in
+                2|6|7|19|29) keep=true ;;
+                *) [ "$aria_rc" -gt 128 ] && [ "$aria_rc" -ne 153 ] && keep=true ;;
+            esac
+            if ! $keep || ! _resumable_pair "$temp_file"; then
+                rm -f -- "$temp_file" "$temp_file.aria2"
+            fi
         fi
     done
     rm -f -- "$aria_err"
@@ -1541,6 +1660,8 @@ analyze_updates() {
     
     local total_updates=0
     local total_download_size=0
+    local total_partial_credit=0   # bytes already on disk in resumable partials
+    local kept_parts=()            # partials _drop_dead_partials must keep (offered names, skipped stems)
     local skipped_files=0
     local unknown_sizes=0
     
@@ -1587,6 +1708,7 @@ analyze_updates() {
                 "SKIPPED" \
                 "No match in library"
             skipped_files=$((skipped_files + 1))
+            kept_parts+=("$(_zim_stem "$filename")")
             continue
         fi
         
@@ -1600,8 +1722,11 @@ analyze_updates() {
         # 'size' criterion reports "Unknown" (it has no other signal); 'newer'
         # and 'all' fall back to date-only comparison rather than letting an
         # empty value drive a wrong "up to date" verdict or an arithmetic error.
+        # Bounded and forced to base 10 before any $(( )): see get_remote_size.
         local size_known=true
-        if ! [[ "$remote_size" =~ ^[0-9]+$ ]]; then
+        if [[ "$remote_size" =~ ^[0-9]{1,15}$ ]]; then
+            remote_size=$(( 10#$remote_size ))
+        else
             size_known=false
             remote_size=0
             unknown_sizes=$((unknown_sizes + 1))
@@ -1633,10 +1758,21 @@ analyze_updates() {
            || [[ "$latest_url" == *..* ]] \
            || [[ "$latest_url" =~ [[:space:][:cntrl:]] ]]; then
             log "WARN" "Skipping ${filename}: untrusted catalog URL '$(_disp "$latest_url")'"
+            skipped_files=$((skipped_files + 1))
+            kept_parts+=("$(_zim_stem "$filename")")
             continue
         fi
         local latest_name="${latest_filename%.zim}"
-        
+        # Validate the catalog-derived name before it builds any path (the
+        # partial-download credit below stats TEMP_DIR/<name>.zim.part).
+        if ! is_safe_zim_name "$latest_name"; then
+            log "WARN" "Skipping ${filename}: unsafe catalog name '$(_disp "$latest_name")'"
+            skipped_files=$((skipped_files + 1))
+            kept_parts+=("$(_zim_stem "$filename")")
+            continue
+        fi
+        kept_parts+=("${latest_name}.zim.part")   # the catalog offers this file: its partial can resume
+
         local status="Up to date"
         local details=""
         local update_needed=false
@@ -1769,6 +1905,12 @@ analyze_updates() {
         if $update_needed; then
             total_updates=$((total_updates + 1))
             total_download_size=$((total_download_size + remote_size))
+            if $size_known; then
+                local credit
+                credit=$(_partial_alloc_bytes "${WORK_DIR}/${latest_name}.zim")
+                [ "$credit" -gt "$remote_size" ] && credit=$remote_size
+                total_partial_credit=$((total_partial_credit + credit))
+            fi
             FILES_TO_UPDATE+=("$f|$latest_url|$latest_name|$remote_size")
         fi
         
@@ -1798,9 +1940,22 @@ analyze_updates() {
     # Check available space
     if [ $total_updates -gt 0 ]; then
         local free_space=$(get_free_space)
-        if [ "${total_download_size}" -gt "${free_space}" ]; then
+        # Bytes already on disk in resumable partials need no new space.
+        local still_needed=$((total_download_size - total_partial_credit))
+        [ "$still_needed" -lt 0 ] && still_needed=0
+        # Never on check-updates (it only reports). Skipped files' partials are
+        # protected by stem in kept_parts (a skip may be a transient glitch).
+        if [ "${still_needed}" -gt "${free_space}" ] && [ "${COMMAND:-}" != check-updates ]; then
+            local freed
+            freed=$(_drop_dead_partials "${kept_parts[@]}")
+            if [ "$freed" -gt 0 ]; then
+                log "INFO" "Discarded partial downloads of files the catalog no longer offers ($(numfmt --to=iec-i --suffix=B "$freed"))"
+                free_space=$(get_free_space)
+            fi
+        fi
+        if [ "${still_needed}" -gt "${free_space}" ]; then
             log "ERROR" "Not enough free space for updates"
-            log "ERROR" "Required: $(numfmt --to=iec-i --suffix=B "${total_download_size}")"
+            log "ERROR" "Required: $(numfmt --to=iec-i --suffix=B "${still_needed}")"
             log "ERROR" "Available: $(numfmt --to=iec-i --suffix=B "${free_space}")"
             return 1
         fi
@@ -1868,9 +2023,12 @@ do_smart_update() {
         
         # Check space if different files
         if [ "$f" != "$new_filepath" ]; then
-            local remote_size
+            local remote_size needed
             if remote_size=$(get_remote_size "$remote_url"); then
-                if ! check_disk_space "$remote_size"; then
+                # A resumable partial's bytes are already on disk.
+                needed=$(( remote_size - $(_partial_alloc_bytes "$new_filepath") ))
+                [ "$needed" -lt 0 ] && needed=0
+                if ! check_disk_space "$needed"; then
                     log "ERROR" "Not enough space for ${new_name}.zim"
                     total_failed=$((total_failed + 1))
                     if ! $CONTINUE_ON_ERROR; then
@@ -2085,6 +2243,7 @@ acquire_run_lock() {
     return 1
 }
 
+# $1 = "full" (the clean command) also discards resumable partial downloads.
 clean_state() {
     # Create work directory if it doesn't exist
     mkdir -p "${WORK_DIR}" 2>/dev/null || true
@@ -2108,9 +2267,11 @@ clean_state() {
           "${STATUS_FILE}" \
           "${LIBRARY_CACHE}" 2>/dev/null || true
     
-    # Remove temp directory if it exists
-    if [ -d "${TEMP_DIR}" ]; then
+    # Clear the temp directory, keeping recent resumable partials unless "full".
+    if [ "${1:-}" = full ]; then
         rm -rf "${TEMP_DIR}" 2>/dev/null || true
+    else
+        _prune_temp_dir
     fi
 }
 
@@ -2388,8 +2549,8 @@ main() {
             ensure_trusted_dirs "${WORK_DIR}" || exit 1
             LOGFILE_SAFE=true
             acquire_run_lock || exit 1   # never wipe a live run's state
-            clean_state
-            echo "All logs and state files cleared"
+            clean_state full
+            echo "All logs, state files and partial downloads cleared"
             exit 0
             ;;
     esac

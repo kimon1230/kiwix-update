@@ -149,7 +149,7 @@ sudo ./kiwix-update.sh status
 # Stop a background (-b) run, together with its download
 sudo ./kiwix-update.sh stop
 
-# Remove logs and state files (refused while a run is in progress)
+# Remove logs, state files and partial downloads (refused while a run is in progress)
 sudo ./kiwix-update.sh clean
 
 # Show all commands, options and environment variables
@@ -242,6 +242,16 @@ Uses aria2c for multi-connection downloads with automatic retry logic. Each down
 
 The catalog and metalink metadata are always fetched over **HTTPS from the `kiwix.org` domain** (the catalog uses the OPDS v2 endpoint `catalog/v2/entries`; the `.meta4` is served directly by the load balancer), so the hash is authoritative. The bulk `.zim` transfer itself is delivered via `lb.download.kiwix.org`, which redirects to a **rotating pool of mirrors** — some of which are HTTP-only. Because the SHA-256 hash is the integrity control, an HTTP mirror hop is permitted **on the default path** (a tampered mirror is caught after download). If you would rather refuse HTTP mirrors outright, pass `--https-only` (downloads may then fail on HTTP-mirror days). When `--allow-unverified` drops the hash gate, transport is automatically forced HTTPS-only regardless — without a hash, transport is the only remaining control. Temporary files are isolated to prevent corruption of active collections.
 
+### Resuming Interrupted Downloads
+
+A download that is interrupted (Ctrl-C, `stop`, a dropped connection, a timeout, a busy server) keeps its partial file in `temp/` and resumes where it left off on the next attempt or the next run. The resumed file is still verified against the SHA-256 hash before it is installed.
+
+- `clean` discards partial downloads; the next run starts those files from scratch.
+- Under `--allow-unverified`, a file's partial is discarded and the file is downloaded from scratch: without a hash, a resumed file could not be trusted.
+- A partial abandoned for 14 days is pruned automatically (`PARTIAL_MAX_AGE_DAYS` at the top of the script).
+- A failure that would repeat on resume (the file changed on the server, the mirror does not support resuming, a failed verification) discards the partial.
+- An interruption during verification (after the download finished), or an unreachable hash server, discards the finished file: it is downloaded again from the start.
+
 ## Monitoring and Logging
 
 All operations are logged to `kiwix_update.log` in the working directory (`/var/local/zims/kiwix_update.log` by default) with structured timestamps and severity levels. Background processes maintain status files for monitoring:
@@ -274,10 +284,10 @@ Run `sudo ./kiwix-update.sh update-library`. It rebuilds a missing or empty libr
 The script must be executable (`chmod +x kiwix-update.sh`), because the background run re-launches it.
 
 **Network timeout errors:**
-On unstable connections, reduce parallel connections (`-p:2`) and/or cap bandwidth (`-m:2M`). Each file gets up to 3 download attempts, and aria2c itself makes up to 3 tries within each attempt; timeouts are fixed and not configurable. If the SHA-256 metalink is temporarily unreachable, the file's attempts stop at once (a new download could not be verified either) and it is tried again on the next run. A failed attempt is discarded, so the next attempt (or the next run) downloads the file from the start. The reason aria2c gave is written to the log.
+On unstable connections, reduce parallel connections (`-p:2`) and/or cap bandwidth (`-m:2M`). Each file gets up to 3 download attempts, and aria2c itself makes up to 3 tries within each attempt; timeouts are fixed and not configurable. If the SHA-256 metalink is temporarily unreachable, the file's attempts stop at once (a new download could not be verified either) and it is tried again on the next run. A download cut off by a network problem resumes on the next attempt (or the next run) instead of starting over; see [Resuming Interrupted Downloads](#resuming-interrupted-downloads). The reason aria2c gave is written to the log.
 
 **Disk space limitations:**
-Pre-flight space checking prevents partial downloads, but ensure adequate free space for largest expected files (Wikipedia collections can exceed 100GB).
+Pre-flight space checking refuses a download that cannot fit (bytes already on disk in a resumable partial count as done). Partials also hold space until they finish, are pruned (see Resuming Interrupted Downloads), or `clean` discards them; a partial of a version the catalog has since replaced can never resume, so when space is short such partials are discarded automatically before the space check refuses. Ensure adequate free space for largest expected files (Wikipedia collections can exceed 100GB).
 
 **Service restart failures:**
 Manual service management may be required if automatic restart fails:
@@ -326,7 +336,7 @@ Failures still show up in the exit code even though output is discarded.
 ```
 /var/local/zims/
 ├── [content].zim                # ZIM content files
-├── temp/                        # Download staging area
+├── temp/                        # Download staging area (resumable partials)
 ├── backups/                     # Library configuration backups
 ├── kiwix_update.log             # Operation log
 ├── .kiwix_update_status         # Process status
