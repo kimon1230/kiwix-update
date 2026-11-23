@@ -1040,6 +1040,13 @@ _download_strict() {
     ${HTTPS_ONLY} || ${ALLOW_UNVERIFIED}
 }
 
+# The catalog 'length' is the file size rounded UP to a whole KiB (a 230348-byte
+# ZIM is listed as 230400). Every catalog-vs-local size comparison goes through
+# this. $1 = bytes -> echoes bytes rounded up to the next multiple of 1024.
+_kib_ceil() {
+    echo $(( ($1 + 1023) / 1024 * 1024 ))
+}
+
 get_remote_size() {
     local url="$1"
     local size
@@ -1153,9 +1160,9 @@ verify_downloaded_file() {
         return 0
     elif [ "$rc" -eq 2 ]; then
         # Transient metalink-fetch error (rc 2): NOT a definitive integrity
-        # failure. Signal the caller with a distinct rc 2 so it keeps the
-        # already-downloaded payload instead of discarding+re-downloading it
-        # (a multi-GB .zim must not be thrown away over a metalink HEAD blip).
+        # failure. Signal the caller with a distinct rc 2 so it stops retrying
+        # this file (a re-download could not be verified either while the
+        # metalink is unreachable) instead of re-downloading a multi-GB .zim.
         log "WARN" "Transient error fetching metalink for $file — cannot verify this run"
         return 2
     else
@@ -1181,7 +1188,11 @@ verify_downloaded_file() {
         return 1
     fi
     actual_size=$(stat -c%s "$temp_file" 2>/dev/null) || return 1
-    if [ "$actual_size" != "$expected_size" ]; then
+    # Match at the catalog's KiB granularity (an exact match is accepted too).
+    # Accepted limit of size-only mode: a payload up to 1023 bytes short of the
+    # real file still passes, since the catalog cannot express anything finer.
+    if [ "$actual_size" -ne "$expected_size" ] \
+       && [ "$(_kib_ceil "$actual_size")" -ne "$expected_size" ]; then
         log "ERROR" "Size mismatch - expected: $expected_size, got: $actual_size"
         return 1
     fi
@@ -1251,10 +1262,13 @@ download_file() {
     fi
 
     mkdir -p "${TEMP_DIR}" || return 1
-    
-    # Remove existing temp file
-    rm -f "$temp_file"
-    
+
+    # Always start from a clean temp file. aria2c resumes from a leftover
+    # .aria2 control file on its own, and a stale or foreign temp file can
+    # become a correct-size, wrong-content payload that size-only verification
+    # accepts — so both are removed before every download.
+    rm -f -- "$temp_file" "$temp_file.aria2"
+
     # Confirm download if not auto-yes
     if ! ${YES_TO_ALL}; then
         # Guard the size BY VALUE, not by exit status: `local size=$(...)` always
@@ -1292,10 +1306,10 @@ download_file() {
     if ! final_url=$(curl -sLI --proto "$resolve_proto" --proto-redir "$resolve_proto" \
         --max-redirs 1 -o /dev/null -w '%{url_effective}' -- "$url") || [ -z "$final_url" ]; then
         # Do NOT fall back to the un-resolved LB URL: the LB always 302s the
-        # .zim, so handing it to aria2c would either fail confusingly or (with a
-        # nonzero --max-redirect) re-open the uncontrolled-redirect hole. The
-        # hash still gates integrity, but transport safety comes from resolving
-        # here — so a resolve failure is a genuine failure: WARN + return 1.
+        # .zim, and aria2c would follow that redirect unchecked (it cannot
+        # restrict redirect schemes or hops). The hash still gates integrity,
+        # but transport safety comes from resolving here — so a resolve failure
+        # is a genuine failure: WARN + return 1.
         log "ERROR" "Failed to resolve download URL for $filename — skipping"
         return 1
     fi
@@ -1332,7 +1346,6 @@ download_file() {
         --max-connection-per-server="${PARALLEL_CONNECTIONS}"
         --min-split-size=1M
         --file-allocation=none
-        --continue=true
         --dir="$(dirname "$temp_file")"
         --out="$(basename "$temp_file")"
         --check-certificate=true
@@ -1342,23 +1355,29 @@ download_file() {
         --connect-timeout=60
         --remote-time=true
         --console-log-level=error
-        # The URL is already the curl-resolved terminal mirror URL (which serves
-        # the file 200-direct), so aria2c needs NO redirects. --max-redirect=0 on
-        # every path: a redirect here could only come from a mirror re-redirect,
-        # which is exactly the attacker-injectable SSRF hop we refuse. aria2c has
-        # no --proto, so 0 also forecloses an ftp:// redirect leg.
-        --max-redirect=0
+        # Plain (uncoloured) error lines, so they can be copied into the log.
+        --enable-color=false
+        # The URL is already the curl-resolved terminal mirror URL (served
+        # 200-direct), so aria2c normally sees no redirect. aria2c has NO option
+        # to disable or bound redirects (there is no --max-redirect; passing one
+        # makes it exit 28 before downloading), so a mirror re-redirect would be
+        # followed. Integrity does not depend on this: the payload is gated by the
+        # metalink SHA-256 (or, with --allow-unverified, the catalog size) before
+        # it replaces anything, and the response body never leaves this host.
     )
     
     [ -n "${MAX_SPEED}" ] && aria_opts+=(--max-download-limit="${MAX_SPEED}")
 
-    # Apply output-verbosity opts once, before the retry loop
-    # (appending them inside the loop would duplicate flags on every retry)
+    # Apply output-verbosity opts once, before the retry loop (appending them
+    # inside the loop would duplicate flags on every retry). Quiet mode hides
+    # the progress readout but NOT aria2c's error lines (no --quiet), so the
+    # cause of a failure still reaches the log in -q/-b/cron runs.
     if ! ${QUIET}; then
         aria_opts+=(--show-console-readout=true)
     else
-        aria_opts+=(--quiet=true --show-console-readout=false)
+        aria_opts+=(--show-console-readout=false)
     fi
+    local aria_err="${temp_file}.err"
 
     # Compute the hard download byte cap (KiB) for _aria2c_capped. Prefer the
     # authoritative catalog ceiling (expected + 1% + 4K); if the catalog size is
@@ -1400,37 +1419,39 @@ download_file() {
         # dl_rc=$?; fi`, whose `if` condition suspends set -e/pipefail in this
         # body, so a failed aria2c pipeline falls through to the retry logic
         # below instead of aborting the script.
+        # One filter for both modes: it draws the progress bar (non-quiet only)
+        # and collects aria2c's error lines into $aria_err, which is logged
+        # below if the download fails.
         local aria_rc
-        if ! ${QUIET}; then
-            _aria2c_capped "$fcap_kib" "${aria_opts[@]}" -- "$final_url" 2>&1 | \
-                awk -v filename="$filename" '
-                /\[#.*\]/ {
-                    match($0, /([0-9]+)%/)
-                    pct = substr($0, RSTART, RLENGTH-1)
-                    match($0, /DL:([0-9.]+[KMGT]?i?B\/s)/)
-                    speed = substr($0, RSTART+3, RLENGTH-3)
-                    bar = ""
-                    for(i=0; i<pct/2; i++) bar = bar "#"
-                    for(i=pct/2; i<50; i++) bar = bar "-"
-                    printf "\rDownloading %s: [%s] %3d%% %s", filename, bar, pct, speed
-                    fflush()
-                }'
-            aria_rc=${PIPESTATUS[0]}
-            echo
-        else
-            _aria2c_capped "$fcap_kib" "${aria_opts[@]}" -- "$final_url" > /dev/null 2>&1
-            aria_rc=$?
-        fi
+        : > "$aria_err"
+        _aria2c_capped "$fcap_kib" "${aria_opts[@]}" -- "$final_url" 2>&1 | \
+            awk -v filename="$filename" -v quiet="${QUIET}" -v errfile="$aria_err" '
+            /\[#.*\]/ {
+                if (quiet == "true") next
+                match($0, /([0-9]+)%/)
+                pct = substr($0, RSTART, RLENGTH-1)
+                match($0, /DL:([0-9.]+[KMGT]?i?B\/s)/)
+                speed = substr($0, RSTART+3, RLENGTH-3)
+                bar = ""
+                for(i=0; i<pct/2; i++) bar = bar "#"
+                for(i=pct/2; i<50; i++) bar = bar "-"
+                printf "\rDownloading %s: [%s] %3d%% %s", filename, bar, pct, speed
+                fflush()
+                next
+            }
+            /ERROR|errorCode=|unrecognized option/ { print >> errfile }'
+        aria_rc=${PIPESTATUS[0]}
+        ${QUIET} || echo
 
         if [ "$aria_rc" -eq 0 ] && [ -f "$temp_file" ] && [ -s "$temp_file" ]; then
             # Three-way branch on the verify exit code (this whole body runs with
             # set -e suspended — download_file is called via `if download_file`),
             # so verify_downloaded_file's non-zero rc does NOT abort here:
             #   0 => verified            -> install (mv temp_file -> output)
-            #   2 => TRANSIENT metalink  -> KEEP payload, do NOT re-download, fail
-            #        this run. A completed multi-GB .zim must not be discarded over
-            #        a metalink HEAD blip; the natural retry is the next scheduled
-            #        run, so break the OUTER retry loop WITHOUT rm-ing temp_file.
+            #   2 => TRANSIENT metalink  -> fail this file WITHOUT re-downloading:
+            #        the hash is unreachable right now, so another multi-GB
+            #        download could not be verified either. Break the OUTER retry
+            #        loop; the next scheduled run tries again from scratch.
             #   1 => DEFINITIVE failure  -> discard (rm) and let the outer loop
             #        re-download from scratch (hash mismatch / no-hash-block / size).
             local vrc
@@ -1447,27 +1468,27 @@ download_file() {
                     fi
                     ;;
                 2)
-                    # KEEP temp_file (do NOT rm): this is not a stale-file leak.
-                    # A foreground run's cleanup() wipes TEMP_DIR at exit, so the
-                    # payload does not linger. A background run intentionally keeps
-                    # TEMP_DIR, so the completed-but-unverified payload survives and
-                    # the next run's aria2c (--continue=true) reuses it instead of
-                    # re-downloading a multi-GB .zim over a transient metalink blip.
-                    log "ERROR" "Metalink temporarily unavailable for $filename — not installing unverified; keeping payload for the next run"
+                    log "ERROR" "Metalink temporarily unavailable for $filename — not installing unverified; will retry on the next run"
+                    rm -f -- "$temp_file" "$temp_file.aria2"
                     success=false
-                    break   # exit the OUTER retry loop; KEEP temp_file; do NOT re-run aria2c
+                    break   # exit the OUTER retry loop; do NOT re-run aria2c
                     ;;
                 *)
                     log "ERROR" "File verification failed for $filename"
-                    rm -f "$temp_file"   # definitive => discard, allow outer re-download
+                    rm -f -- "$temp_file" "$temp_file.aria2"   # definitive => discard, allow outer re-download
                     ;;
             esac
         else
-            log "ERROR" "Download failed for $filename"
-            rm -f "$temp_file"
+            log "ERROR" "Download failed for $filename (aria2c exit ${aria_rc})"
+            local aria_line
+            while IFS= read -r aria_line; do
+                log "ERROR" "aria2c: ${aria_line}"
+            done < "$aria_err"
+            rm -f -- "$temp_file" "$temp_file.aria2"
         fi
     done
-    
+    rm -f -- "$aria_err"
+
     [ "$success" = true ]
 } 9>&-   # aria2c and its helpers must not inherit the run lock (see acquire_run_lock)
 
@@ -1586,6 +1607,11 @@ analyze_updates() {
             unknown_sizes=$((unknown_sizes + 1))
             log "WARN" "No catalog size for ${filename} — using date-only comparison"
         fi
+        # An unchanged file is 1-1023 bytes "smaller" than its KiB-rounded catalog
+        # entry. "Larger" therefore means larger than the local size rounded up
+        # (see _kib_ceil), or every up-to-date file is re-downloaded each run.
+        local local_kib_size
+        local_kib_size=$(_kib_ceil "$local_size")
 
         # latest_path now holds the absolute acquisition URL from the v2 feed.
         local latest_url="$latest_path"
@@ -1621,9 +1647,9 @@ analyze_updates() {
                 if ! $size_known; then
                     status="Unknown"
                     details="missing catalog size"
-                elif [ "$remote_size" -gt "$local_size" ]; then
+                elif [ "$remote_size" -gt "$local_kib_size" ]; then
                     status="Update needed"
-                    local size_diff=$((remote_size - local_size))
+                    local size_diff=$((remote_size - local_kib_size))
                     details="Size increased by $(numfmt --to=iec-i --suffix=B $size_diff)"
                     update_needed=true
                     if [ "$latest_name.zim" != "$filename" ]; then
@@ -1688,8 +1714,8 @@ analyze_updates() {
                 local reasons=()
                 
                 # Check size (only when the remote size is known)
-                if $size_known && [ "$remote_size" -gt "$local_size" ]; then
-                    local size_diff=$((remote_size - local_size))
+                if $size_known && [ "$remote_size" -gt "$local_kib_size" ]; then
+                    local size_diff=$((remote_size - local_kib_size))
                     reasons+=("size +$(numfmt --to=iec-i --suffix=B $size_diff)")
                     should_update=true
                 fi
@@ -1883,7 +1909,6 @@ do_smart_update() {
             fi
         else
             total_updated=$((total_updated + 1))
-            log "INFO" "Successfully downloaded ${new_name}.zim"
             
             if [ "$f" != "$new_filepath" ] && [ -f "$f" ]; then
                 log "INFO" "Transitioning from $filename to ${new_name}.zim"
@@ -2079,6 +2104,7 @@ clean_state() {
           "${WORK_DIR}"/.kiwix_was_running \
           "${WORK_DIR}"/kiwix_update.log* \
           "${WORK_DIR}"/.heartbeat \
+          "${WORK_DIR}"/.progress \
           "${STATUS_FILE}" \
           "${LIBRARY_CACHE}" 2>/dev/null || true
     
@@ -2526,33 +2552,37 @@ main() {
         export KIWIX_BACKGROUND=1
         export UPDATE_CRITERIA
 
-        # Redirect output and launch background process
-        exec 3>&1
+        # Keep the caller's stdout/stderr on fds 3/4 for the launcher's own
+        # messages; everything else from here goes to the log.
+        exec 3>&1 4>&2
         exec 1>>"${LOG_FILE}" 2>&1
 
         # setsid: the child leads its own process group, so `stop` can signal it
         # together with its aria2c/sha256sum. Not a group leader here, so setsid
-        # execs in place and $! stays the child's PID.
-        nohup setsid "$0" "${ORIGINAL_ARGS[@]}" </dev/null >>"${LOG_FILE}" 2>&1 &
+        # execs in place and $! stays the child's PID. `3>&- 4>&-`: the child
+        # must not inherit the caller's stdout/stderr, or a caller reading them
+        # (ssh, a pipe, cron) would block until the whole update finishes.
+        nohup setsid "$0" "${ORIGINAL_ARGS[@]}" </dev/null >>"${LOG_FILE}" 2>&1 3>&- 4>&- &
         pid=$!
 
         # Exclusive create; refuse (and reap the child) if a live process
         # already holds the PID file. The child does NOT re-write it.
         if ! create_pid_file "$pid"; then
             kill "$pid" 2>/dev/null || true
+            echo "Error: could not start the background run (see ${LOG_FILE})" >&4
             exit 1
         fi
 
         echo "Process started in background with PID $pid. Use '$(basename "$0") status' to check progress." >&3
-        exec 3>&-
 
         # Verify process started
         sleep 2
         if ! kill -0 $pid 2>/dev/null; then
-            echo "Warning: Background process failed to start" >&2
+            echo "Warning: Background process failed to start" >&4
             rm -f "${PID_FILE}"
             exit 1
         fi
+        exec 3>&- 4>&-
 
         exit 0
     fi

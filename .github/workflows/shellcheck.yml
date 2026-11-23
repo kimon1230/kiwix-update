@@ -59,13 +59,22 @@ jobs:
       # other suite. Empty-glob-safe via find -print0 | xargs -0 -r.
       - name: ShellCheck test suites
         run: find tests -name '*.sh' -print0 | xargs -0 -r shellcheck --severity=warning --exclude=SC2155
+      # Real aria2c lets verify_catalog_v2.sh check that every option the script
+      # passes exists (the suites otherwise use an accept-anything stub; an
+      # unsupported flag once made every download fail). Deliberately the distro
+      # package, not a pinned build: it should match what users apt-install.
+      - name: Install aria2
+        run: |
+          command -v aria2c >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends aria2; }
+          aria2c --version | head -n 1
       # Functional + security regression harnesses: exercise the real functions
       # with stubbed curl/aria2c/service managers (no network — the live smoke is
       # gated behind KIWIX_LIVE, left unset here). The loop auto-picks-up EVERY
       # tests/*.sh so new suites gate CI without editing this workflow. Covered:
       #   verify_catalog_v2.sh   — catalog parse, URL host-pin, transport/SSRF
       #                            policy, download return-code contract, SHA-256
-      #                            integrity + disk-fill + update-decision arms.
+      #                            integrity + disk-fill + update-decision arms,
+      #                            real-aria2c option-name check (needs aria2).
       #   verify_unprivileged.sh — trust-gate / run-mode / service-guard security
       #                            suite (M6: previously never ran in CI).
       #   verify_c1_sensitivity.sh — non-vacuity harness for the SHA-256 tests.

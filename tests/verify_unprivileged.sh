@@ -462,6 +462,33 @@ kill -- "-$otherpid" 2>/dev/null
   && pass "B3.33 PID file naming an unrelated live process group (even named like the script): nothing signalled" \
   || fail "B3.33 unrelated alive=$ualive out: $(tr '\n' ' ' <<< "$out")"
 
+# B3.34: the REAL -b launcher (a separate process, as a user runs it) must not
+# leave the caller's stdout/stderr open in the background child: a caller that
+# reads them (ssh, a pipe, cron) would otherwise block until the whole update
+# finished. The stub kiwix-manage keeps the child alive for BG_CHILD_SECS; the
+# launcher's output pipe must close while the child is still running.
+BG_CHILD_SECS=30        # how long the background child stays busy
+BG_LAUNCH_MAX_SECS=15   # > the launcher's own 2s liveness sleep, < BG_CHILD_SECS
+WDB=$(mktemp -d "$ROOT/bg.XXXXXX"); chmod 755 "$WDB"; : > "$WDB/a.zim"
+mkdir -p "$ROOT/bgbin"
+printf '#!/bin/sh\nexit 0\n'          > "$ROOT/bgbin/aria2c"
+printf '#!/bin/sh\nsleep %s\nexit 0\n' "$BG_CHILD_SECS" > "$ROOT/bgbin/kiwix-manage"
+printf '#!/bin/sh\nexit 1\n'          > "$ROOT/bgbin/pidof"
+printf '#!/bin/sh\nexit 1\n'          > "$ROOT/bgbin/pgrep"
+chmod +x "$ROOT"/bgbin/*
+for d in "$WDB" "$WDB/temp" "$WDB/backups"; do printf '%s\t%s\t755\n' "$d" "$(id -u)"; done > "$ROOT/bg.statmap"
+t0=$SECONDS
+out=$(FAKE_UID=$(id -u) STATMAP="$ROOT/bg.statmap" KIWIX_WORK_DIR="$WDB" PATH="$ROOT/bgbin:$SHIM_PATH" \
+      "$SCRIPT" update-library -b -y 2>&1 | cat)
+took=$((SECONDS - t0))
+bgpid=$(grep -oE 'PID [0-9]+' <<< "$out" | grep -oE '[0-9]+')
+bgpid=${bgpid:-$(cat "$WDB/.kiwix_update.pid" 2>/dev/null)}   # reap the child even if the message changes
+bgalive=no; [ -n "$bgpid" ] && kill -0 "$bgpid" 2>/dev/null && bgalive=yes
+[ -n "$bgpid" ] && kill -- "-$bgpid" 2>/dev/null
+{ [ "$bgalive" = yes ] && [ "$took" -lt "$BG_LAUNCH_MAX_SECS" ] && grep -q "Process started in background" <<< "$out"; } \
+  && pass "B3.34 -b launcher returns in ${took}s while the child still runs (caller's stdout not held)" \
+  || fail "B3.34 took=${took}s child_alive=$bgalive out: $(tr '\n' ' ' <<< "$out")"
+
 # --- absent leaf under a non-writable parent: actionable, mode-aware error ----
 # The forgot-KIWIX_WORK_DIR case (non-root left at the root-owned /var/local/zims)
 # must NOT surface a misleading "pre-plant race" — it must point at the fix.

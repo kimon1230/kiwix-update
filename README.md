@@ -20,7 +20,7 @@ Key capabilities:
 
 - **Differential updates**: only ZIMs with a newer or larger catalog version are downloaded.
 - **Verified downloads**: every file is checked against the SHA-256 hash in the Kiwix metalink before it replaces anything.
-- **Resumable, multi-connection transfers** via aria2c, with bandwidth limits.
+- **Multi-connection transfers** via aria2c, with automatic retries and bandwidth limits.
 - **Library synchronization** with `library_zim.xml`, without touching entries for ZIMs kept elsewhere.
 - **Safe to automate**: one run at a time, clean handling of Ctrl-C/SIGTERM (kiwix-serve is restarted), and exit codes that cron and systemd understand.
 - **Root or unprivileged**: manages the `kiwix-serve` service as root, or updates a directory you own without root.
@@ -41,9 +41,36 @@ single user running against a directory they own — see [Run modes](#run-modes)
 
 Download and prepare the script:
 ```bash
-wget https://raw.githubusercontent.com/kimon1230/kiwix-update/main/kiwix-update.sh
+wget -O kiwix-update.sh https://raw.githubusercontent.com/kimon1230/kiwix-update/main/kiwix-update.sh
 chmod +x kiwix-update.sh
 ```
+
+**Required before the first root run — fix `/var/local` permissions.** In root
+mode the script refuses any working or library directory that is, or has a
+parent that is, group/other-writable or not root-owned. Stock Debian and
+Raspberry Pi OS ship `/var/local` as `2775 root:staff` (group-writable), so out of
+the box every `sudo` command fails with:
+
+```
+ERROR: Refusing /var/local/zims: it or an ancestor is group/other-writable, or not owned by uid 0 (root) (root ancestors are allowed).
+```
+
+Pick one:
+
+```bash
+# Option A (simplest): remove group write from /var/local and keep the defaults
+sudo chmod g-w /var/local
+sudo chmod g-w,o-w /var/local/zims 2>/dev/null || true   # only if it already exists
+
+# Option B: leave /var/local alone and use root-owned paths elsewhere.
+# BOTH variables are needed — the library's directory is checked too.
+sudo KIWIX_WORK_DIR=/var/lib/kiwix KIWIX_ZIM_LIBRARY=/var/lib/kiwix/library_zim.xml \
+    ./kiwix-update.sh check-updates
+```
+
+With Option B, pass the variables on every invocation (plain `sudo` drops your
+environment), in your cron/systemd unit, and point `kiwix-serve` at the new
+library path. To diagnose which directory is failing: `namei -l /var/local/zims`.
 
 Default file locations (override with the environment variables below):
 - ZIM files: `/var/local/zims/`
@@ -55,12 +82,11 @@ Default file locations (override with the environment variables below):
 | `KIWIX_WORK_DIR` | Directory holding the ZIM files and state | `/var/local/zims` |
 | `KIWIX_ZIM_LIBRARY` | Path to `library_zim.xml` | `/var/local/library_zim.xml` (root mode); `$KIWIX_WORK_DIR/library_zim.xml` (unprivileged mode) |
 
-**Permissions prerequisite (security):** the working directory and every parent
-must be owned by root and not group/other-writable. On stock Debian `/var/local`
-is `2775 root:staff` (group-writable), so the script will refuse to run until you
-either tighten it (`sudo chmod g-w /var/local`) or point `KIWIX_WORK_DIR` at a
-root-owned path such as `/var/lib/kiwix`. This prevents a non-root user from
-pre-planting directories or symlinks that root would otherwise act on.
+**Why the permissions prerequisite exists (security):** in root mode the working
+directory, the library's directory, and every parent of each must be owned by
+root and not group/other-writable (see the required step above). This prevents a
+non-root user from pre-planting directories or symlinks that root would
+otherwise act on.
 
 ## Run modes
 
@@ -68,8 +94,8 @@ The script picks a mode automatically from the effective UID — there is no fla
 
 - **Root mode** (`euid == 0`): the behavior described throughout this README —
   manages the `kiwix-serve` service, chowns the library to `root:root`, and
-  defaults to `/var/local`. `KIWIX_WORK_DIR` and all its ancestors must be
-  root-owned and not group/other-writable.
+  defaults to `/var/local`. `KIWIX_WORK_DIR`, the library's directory, and all
+  their ancestors must be root-owned and not group/other-writable.
 
 - **Unprivileged mode** (any non-root user): for a single user updating ZIMs in a
   directory they own (e.g. `KIWIX_WORK_DIR=$HOME/zims`). It performs no `chown`
@@ -96,8 +122,9 @@ Notes and limits:
 - The threat model is **peer users, not root**. Trust checks are
   ownership/permission based only (no ACL or NFS awareness) and assume a **local
   filesystem**.
-- Under `sudo`, pass `-E` (or set the `KIWIX_*` vars in the sudo environment) if
-  you need your `KIWIX_WORK_DIR`/`KIWIX_ZIM_LIBRARY` overrides to survive.
+- Plain `sudo` drops your environment, so `KIWIX_*` overrides exported in your
+  shell are ignored. Pass them inline (`sudo KIWIX_WORK_DIR=... ./kiwix-update.sh ...`)
+  or use `sudo -E`.
 
 ## Usage
 
@@ -156,7 +183,7 @@ sudo ./kiwix-update.sh clean
 
 The script supports three update determination methods:
 
-- **size**: Update when remote file is larger than local version
+- **size**: Update when the catalog size exceeds the local file size (compared at 1 KiB granularity, because the catalog rounds sizes up to a whole KiB)
 - **newer**: Update when remote file has more recent timestamp
 - **all**: Update when either size or date criteria indicate newer content (default)
 
@@ -217,7 +244,7 @@ The catalog and metalink metadata are always fetched over **HTTPS from the `kiwi
 
 ## Monitoring and Logging
 
-All operations are logged to `/var/local/zims/kiwix_update.log` with structured timestamps and severity levels. Background processes maintain status files for monitoring:
+All operations are logged to `kiwix_update.log` in the working directory (`/var/local/zims/kiwix_update.log` by default) with structured timestamps and severity levels. Background processes maintain status files for monitoring:
 
 ```bash
 # Real-time log monitoring
@@ -247,7 +274,7 @@ Run `sudo ./kiwix-update.sh update-library`. It rebuilds a missing or empty libr
 The script must be executable (`chmod +x kiwix-update.sh`), because the background run re-launches it.
 
 **Network timeout errors:**
-Adjust timeout values or reduce parallel connections for unstable connections. The script includes automatic retry mechanisms for transient failures.
+On unstable connections, reduce parallel connections (`-p:2`) and/or cap bandwidth (`-m:2M`). Each file gets up to 3 download attempts, and aria2c itself makes up to 3 tries within each attempt; timeouts are fixed and not configurable. If the SHA-256 metalink is temporarily unreachable, the file's attempts stop at once (a new download could not be verified either) and it is tried again on the next run. A failed attempt is discarded, so the next attempt (or the next run) downloads the file from the start. The reason aria2c gave is written to the log.
 
 **Disk space limitations:**
 Pre-flight space checking prevents partial downloads, but ensure adequate free space for largest expected files (Wikipedia collections can exceed 100GB).
@@ -284,10 +311,15 @@ sudo ./kiwix-update.sh check-updates -u:all
 sudo ./kiwix-update.sh smart-update -b -y -m:5M
 ```
 
-Example root crontab entry (nightly at 02:30, quiet, non-interactive):
+Example root crontab entry (nightly at 02:30, quiet, non-interactive). Install the
+script somewhere root-owned first, e.g. `sudo install -m 755 kiwix-update.sh /usr/local/bin/`,
+then add this with `sudo crontab -e`:
 ```cron
 30 2 * * * /usr/local/bin/kiwix-update.sh smart-update -y -q -m:5M >/dev/null 2>&1
 ```
+If you use non-default paths (Option B under [Installation](#installation)), put
+them on the same line: `30 2 * * * KIWIX_WORK_DIR=/var/lib/kiwix KIWIX_ZIM_LIBRARY=/var/lib/kiwix/library_zim.xml /usr/local/bin/kiwix-update.sh ...`.
+Failures still show up in the exit code even though output is discarded.
 
 ## File Organization
 
@@ -298,7 +330,12 @@ Example root crontab entry (nightly at 02:30, quiet, non-interactive):
 ├── backups/                     # Library configuration backups
 ├── kiwix_update.log             # Operation log
 ├── .kiwix_update_status         # Process status
+├── .progress                    # Current download progress (percent:file)
+├── .heartbeat                   # Background-run liveness timestamp
+├── .kiwix_update.pid            # Background (-b) run PID
+├── .kiwix_update_criteria       # Update criteria passed to a -b run
 ├── .kiwix_run.lock              # Run lock (one run at a time)
+├── .kiwix_was_running           # Root mode: kiwix-serve was stopped by this run (restart marker)
 └── .kiwix_library_cache         # Cached catalog data
 ```
 

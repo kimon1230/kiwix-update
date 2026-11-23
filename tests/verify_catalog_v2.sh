@@ -18,6 +18,10 @@ fail(){ echo "FAIL: $1"; FAIL=1; }
 # Capture the REAL curl before the stub bin is prepended to PATH (the live smoke
 # must not hit the stub).
 REAL_CURL="$(command -v curl)"
+# Real aria2c (if installed) to validate the option names the script passes: the
+# argv-logging stub accepts anything, so only the real binary can catch an
+# unsupported flag (which makes aria2c exit 28 and fail every download).
+REAL_ARIA2C="${REAL_ARIA2C:-$(command -v aria2c)}"
 
 # ---------- stubs ----------
 cat > "$ROOT/bin/sleep" <<'S'
@@ -90,6 +94,9 @@ echo "aria2c $*" >> "${ARIA_LOG:-/dev/null}"
 [ -n "${ARIA_FD_LOG:-}" ] && { if [ -e /proc/self/fd/9 ]; then echo present; else echo "fd9 absent"; fi >> "$ARIA_FD_LOG"; }
 dir=""; out=""
 for a in "$@"; do case "$a" in --dir=*) dir="${a#--dir=}";; --out=*) out="${a#--out=}";; esac; done
+[ -n "${STUB_ARIA_MSG:-}" ] && echo "$STUB_ARIA_MSG" >&2
+# Opt-in: record whether the temp file / control file existed when aria2c started.
+[ -n "${ARIA_PREEXIST_LOG:-}" ] && { [ -e "$dir/$out" ] && echo part; [ -e "$dir/$out.aria2" ] && echo ctl; echo end; } >> "$ARIA_PREEXIST_LOG"
 [ "${STUB_ARIA_RC:-0}" -eq 0 ] && [ -n "$dir" ] && [ -n "$out" ] && printf '%s' "${ARIA_CONTENT:-data}" > "$dir/$out"
 exit "${STUB_ARIA_RC:-0}"
 S
@@ -283,15 +290,36 @@ hostpin_test "https://lb.download.kiwix.org/../etc/pintest_2026-01.zim" reject
 # ======================================================================
 echo; echo "########## C5 — transport policy (relaxed / strict / resolve-fail / scheme) ##########"
 mkzim(){ head -c 100 /dev/zero > "$1"; }
-# relaxed default: http mirror ALLOWED, aria2c invoked with --max-redirect=2
+# relaxed default: http mirror ALLOWED, aria2c invoked
 : > "$ARIA_LOG"; : > "$CURL_LOG"
 HTTPS_ONLY=false ALLOW_UNVERIFIED=false YES_TO_ALL=true \
   EFFECTIVE_URL="http://m.invalid/f.zim" MIRROR_SCHEME=http SIZE_CL=100 \
   download_file "https://lb.download.kiwix.org/zim/x/o.zim" "$WORK_DIR/c5r.zim" 100 >/dev/null 2>&1
 grep -q 'aria2c ' "$ARIA_LOG" && pass "C5 relaxed: http mirror hop allowed (aria2c invoked)" || fail "C5 relaxed: aria2c not invoked"
-# F1 (SSRF hardening): aria2c gets --max-redirect=0 on ALL paths (curl already
-# resolved the terminal URL), and the curl resolve is capped at 1 hop.
-grep -qE -- '--max-redirect=0( |$)' "$ARIA_LOG" && pass "F1 aria2c --max-redirect=0 (no attacker-injectable redirect leg)" || fail "F1 aria2c --max-redirect not 0 ($(grep -o -- '--max-redirect=[0-9]*' "$ARIA_LOG"|head -1))"
+# Every long option passed to aria2c must exist in the real aria2c. Required in
+# CI (which installs aria2); skipped locally when aria2c is not installed. The
+# call above ran quiet with no speed cap; add a non-quiet, speed-capped call so
+# the conditional options (-m:, progress readout) are checked too.
+QUIET=false MAX_SPEED=1M HTTPS_ONLY=false ALLOW_UNVERIFIED=false YES_TO_ALL=true \
+  EFFECTIVE_URL="https://m.invalid/f.zim" SIZE_CL=100 \
+  download_file "https://lb.download.kiwix.org/zim/x/o.zim" "$WORK_DIR/c5o.zim" 100 >/dev/null 2>&1
+MIN_ARIA_OPTS=10   # guards against a vacuous pass if argv extraction breaks (the script passes ~17)
+if [ -n "$REAL_ARIA2C" ]; then
+    aria_help=$("$REAL_ARIA2C" --help=#all 2>/dev/null)
+    n_opts=0; bad_opts=""
+    for o in $(grep -oE -- ' --[a-z][a-z-]*' "$ARIA_LOG" | sort -u); do
+        n_opts=$((n_opts + 1))
+        grep -qE -- "^ +(-[A-Za-z0-9], )?${o}(=|\[| |$)" <<<"$aria_help" || bad_opts="$bad_opts $o"
+    done
+    { [ "$n_opts" -ge "$MIN_ARIA_OPTS" ] && [ -z "$bad_opts" ] && grep -q -- '--max-download-limit=1M' "$ARIA_LOG"; } \
+      && pass "aria2c accepts all ${n_opts} options the script passes (quiet + non-quiet + -m:)" \
+      || fail "aria2c option check: checked=${n_opts} unrecognised:${bad_opts:- none}"
+elif [ "${CI:-}" = true ]; then
+    fail "aria2c not installed in CI; the option-name check cannot run"
+else
+    echo "SKIP: aria2c not installed; option-name check not run"
+fi
+# The curl resolve is capped at 1 hop.
 grep -qE -- '--max-redirs 1( |$)' "$CURL_LOG" && pass "F1 curl resolve bounded to 1 hop (--max-redirs 1)" || fail "F1 curl --max-redirs not 1"
 # The run lock (fd 9) must not leak into aria2c: download_file is defined with
 # `} 9>&-`. This shell's fd 9 is NOT close-on-exec, so without that it would.
@@ -311,11 +339,28 @@ exec 9>&-
 HTTPS_ONLY=true YES_TO_ALL=true EFFECTIVE_URL="http://m.invalid/f.zim" MIRROR_SCHEME=http \
   download_file "https://lb.download.kiwix.org/zim/x/o.zim" "$WORK_DIR/c5s.zim" >/dev/null 2>&1
 rc=$?; { [ "$rc" -ne 0 ] && ! grep -q 'aria2c ' "$ARIA_LOG"; } && pass "C5 strict: http mirror refused (aria2c not invoked)" || fail "C5 strict: not refused (rc=$rc)"
-# strict + https mirror: allowed, aria2c --max-redirect=0
+# strict + https mirror: allowed, aria2c invoked
 : > "$ARIA_LOG"
 HTTPS_ONLY=true YES_TO_ALL=true EFFECTIVE_URL="https://m.invalid/f.zim" MIRROR_SCHEME=https SIZE_CL=100 \
   download_file "https://lb.download.kiwix.org/zim/x/o.zim" "$WORK_DIR/c5sh.zim" 100 >/dev/null 2>&1
-grep -qE -- '--max-redirect=0( |$)' "$ARIA_LOG" && pass "C5 strict https: aria2c --max-redirect=0" || fail "C5 strict: --max-redirect not 0"
+grep -q 'aria2c ' "$ARIA_LOG" && pass "C5 strict https: https mirror allowed (aria2c invoked)" || fail "C5 strict https: aria2c not invoked"
+# aria2c failure is diagnosable in both modes: its exit code and its error lines
+# are logged (quiet = -q/-b/cron) and, when not quiet, also shown on stderr.
+for c5e_quiet in true false; do
+    : > "$LOG_FILE"
+    c5e_err=$(LOGFILE_SAFE=true QUIET=$c5e_quiet STUB_ARIA_RC=28 STUB_ARIA_MSG="aria2c: unrecognized option '--bogus'" \
+      HTTPS_ONLY=false YES_TO_ALL=true EFFECTIVE_URL="https://m.invalid/f.zim" SIZE_CL=100 \
+      download_file "https://lb.download.kiwix.org/zim/x/o.zim" "$WORK_DIR/c5e.zim" 100 2>&1 >/dev/null)
+    c5e_ok=true
+    grep -q 'Download failed for c5e.zim (aria2c exit 28)' "$LOG_FILE" || c5e_ok=false
+    grep -q "aria2c: aria2c: unrecognized option '--bogus'" "$LOG_FILE" || c5e_ok=false
+    if [ "$c5e_quiet" = false ]; then
+        grep -q "unrecognized option '--bogus'" <<<"$c5e_err" || c5e_ok=false
+    fi
+    $c5e_ok \
+      && pass "C5e aria2c failure (quiet=$c5e_quiet): exit code and error line logged" \
+      || fail "C5e aria2c failure not surfaced (quiet=$c5e_quiet) log: $(tr '\n' ' ' < "$LOG_FILE" | head -c 200) stderr: ${c5e_err:0:120}"
+done
 # resolve failure: WARN + return 1, aria2c never invoked
 : > "$ARIA_LOG"
 CURL_RESOLVE_FAIL=1 YES_TO_ALL=true \
@@ -493,16 +538,18 @@ fl_expect "foo_en_all_2025-08-15.zim" "foo_en_all_2025-08-15.zim" \
   "pub|foo_en_all_2025-08-15.zim|u|1"
 
 # ======================================================================
-echo; echo "########## M1 — transient (rc2) keeps payload vs definitive (rc1) discards ##########"
+echo; echo "########## M1 — transient (rc2) stops retrying vs definitive (rc1) re-downloads ##########"
 # verify_downloaded_file returns 2 for a TRANSIENT metalink fetch error and 1 for
 # a DEFINITIVE integrity failure. download_file's retry loop must diverge on them:
-#   rc 2 -> KEEP the .part, break WITHOUT re-running aria2c (fail this run).
+#   rc 2 -> break WITHOUT re-running aria2c (fail this run; the hash is
+#           unreachable, so a re-download could not be verified either).
 #   rc 1 -> rm the .part and let the outer loop re-download from scratch.
+# Either way the .part is discarded: partials are not resumed across runs.
 # Both cases run at MAX_RETRIES=2 so the aria2c-invocation count is discriminating
 # (the harness default MAX_RETRIES=1 runs aria2c exactly once either way -> vacuous).
 DL_TMP="$TEMP_DIR/m1out.zim.part"
 
-# --- Transient metalink (503 -> rc 2): payload kept, aria2c run ONCE ------------
+# --- Transient metalink (503 -> rc 2): aria2c run ONCE, payload discarded -------
 : > "$ARIA_LOG"; rm -f "$WORK_DIR/m1out.zim" "$DL_TMP"
 # Omit expected_bytes (no positive catalog size) so the disk-fill guard is skipped
 # and aria2c is actually reached; SIZE_CL kept small/benign.
@@ -514,8 +561,20 @@ rc=$?
 n_aria=$(grep -c 'aria2c ' "$ARIA_LOG")
 [ "$rc" -ne 0 ] && pass "M1 transient: download_file fails this run (rc=$rc)" || fail "M1 transient: rc=$rc (expected non-zero)"
 [ "$n_aria" -eq 1 ] && pass "M1 transient: aria2c invoked exactly once (payload NOT re-downloaded)" || fail "M1 transient: aria2c ran $n_aria times (expected 1)"
-[ -f "$DL_TMP" ] && pass "M1 transient: .part payload preserved in TEMP_DIR" || fail "M1 transient: .part was discarded"
+[ ! -f "$DL_TMP" ] && pass "M1 transient: unverifiable .part discarded (not resumed across runs)" || fail "M1 transient: .part left behind"
 [ ! -f "$WORK_DIR/m1out.zim" ] && pass "M1 transient: nothing installed (fail-closed on integrity)" || fail "M1 transient: an unverified file was installed"
+# A leftover temp file and aria2c control file (e.g. from a killed run) must not
+# be handed to aria2c: it resumes from a leftover control file on its own, and a
+# stale or foreign temp file can yield correct-size, wrong-content data that
+# size-only verification would accept.
+M1_SEEN="$ROOT/m1.seen"; : > "$M1_SEEN"
+printf 'stale' > "$DL_TMP"; printf 'ctl' > "$DL_TMP.aria2"
+STUB_ARIA_RC=1 ARIA_PREEXIST_LOG="$M1_SEEN" YES_TO_ALL=true MIRROR_SCHEME=https SIZE_CL=100 \
+  EFFECTIVE_URL="https://m.invalid/f.zim" \
+  download_file "https://lb.download.kiwix.org/zim/x/m1out.zim" "$WORK_DIR/m1out.zim" >/dev/null 2>&1
+{ [ "$(cat "$M1_SEEN")" = end ] && [ ! -e "$DL_TMP" ] && [ ! -e "$DL_TMP.aria2" ]; } \
+  && pass "M1 leftover .part and .part.aria2 are gone before aria2c starts (and after it fails)" \
+  || fail "M1 leftover temp files: seen-at-start='$(tr '\n' ' ' < "$M1_SEEN")' part=$([ -e "$DL_TMP" ]&&echo y||echo n) ctl=$([ -e "$DL_TMP.aria2" ]&&echo y||echo n)"
 
 # --- Definitive hash-mismatch (200 + wrong hash -> rc 1): discard + re-download -
 : > "$ARIA_LOG"; rm -f "$WORK_DIR/m1out.zim" "$DL_TMP"
@@ -598,6 +657,31 @@ rc=$?
 { [ "$rc" -eq 0 ] && [ -f "$WORK_DIR/c1sf.zim" ]; } \
   && pass "C1 size-fallback: no hash but --allow-unverified + matching catalog size installs" \
   || fail "C1 size-fallback: rc=$rc installed=$([ -f "$WORK_DIR/c1sf.zim" ]&&echo y||echo n)"
+# The catalog rounds sizes UP to a whole KiB, so size-only verification accepts a
+# payload whose size rounds up to the catalog size (or equals it), nothing else.
+c1kib(){ # $1=payload bytes $2=catalog size -> C1K_RC, C1K_INSTALLED, C1K_MISMATCH_LOGGED
+    rm -f "$WORK_DIR/c1k.zim" "$TEMP_DIR/c1k.zim.part"; : > "$LOG_FILE"
+    LOGFILE_SAFE=true YES_TO_ALL=true ALLOW_UNVERIFIED=true MIRROR_SCHEME=https \
+      EFFECTIVE_URL="https://m.invalid/f.zim" SIZE_CL="$1" \
+      ARIA_CONTENT="$(head -c "$1" /dev/zero | tr '\0' x)" META4_CODE=404 \
+      download_file "https://lb.download.kiwix.org/zim/x/c1k.zim" "$WORK_DIR/c1k.zim" "$2" >/dev/null 2>&1
+    C1K_RC=$?
+    C1K_INSTALLED=no; [ -f "$WORK_DIR/c1k.zim" ] && C1K_INSTALLED=yes
+    C1K_MISMATCH_LOGGED=no; grep -q 'Size mismatch' "$LOG_FILE" && C1K_MISMATCH_LOGGED=yes
+}
+for c1k_case in "100 1024 accept" "1024 1024 accept" "1025 1024 refuse" "100 2048 refuse"; do
+    read -r c1k_bytes c1k_cat c1k_want <<< "$c1k_case"
+    c1kib "$c1k_bytes" "$c1k_cat"
+    if [ "$c1k_want" = accept ]; then
+        { [ "$C1K_RC" -eq 0 ] && [ "$C1K_INSTALLED" = yes ]; } \
+          && pass "C1 size-fallback: ${c1k_bytes}-byte payload vs catalog ${c1k_cat} => accepted" \
+          || fail "C1 size-fallback: ${c1k_bytes}-byte payload vs catalog ${c1k_cat} rejected (rc=$C1K_RC)"
+    else
+        { [ "$C1K_RC" -ne 0 ] && [ "$C1K_INSTALLED" = no ] && [ "$C1K_MISMATCH_LOGGED" = yes ]; } \
+          && pass "C1 size-fallback: ${c1k_bytes}-byte payload vs catalog ${c1k_cat} => refused by the size gate" \
+          || fail "C1 size-fallback: ${c1k_bytes}-byte payload vs catalog ${c1k_cat} rc=$C1K_RC installed=$C1K_INSTALLED mismatch_logged=$C1K_MISMATCH_LOGGED"
+    fi
+done
 
 # --- M1: no hash + --allow-unverified + NO catalog size => fail closed ----------
 # Regression for security-audit M1 (crypto CWE-345): under --allow-unverified with
@@ -654,25 +738,35 @@ echo; echo "########## M8 — analyze_updates decision arms (size / newer) #####
 # it purely by the seeded record. Each case resets FILES_TO_UPDATE=()/stray .zim,
 # sets UPDATE_CRITERIA to the arm under test (the harness 'all' leaks), and keeps a
 # valid https://*.kiwix.org field-3 (the host-pin gate else skips before any arm).
-# local_size is the seeded on-disk .zim (100 bytes). newer-arm cases date BOTH the
+# local_size is the seeded on-disk .zim (100 bytes unless m8_run's 5th argument
+# says otherwise; the size arms compare against it rounded up to a whole KiB,
+# i.e. 1024, because the catalog rounds sizes up). newer-arm cases date BOTH the
 # local and catalog names (catalog strictly newer) so is_newer=true and the <50%
 # veto is actually reachable. UPDATE_CRITERIA restored to all at the end (leak is
 # bidirectional).
 BACKGROUND=false
-m8_run(){ # $1=local dated .zim  $2=catalog field-2 dated .zim  $3=field-4  $4=criteria -> M8_HIT
+m8_run(){ # $1=local dated .zim  $2=catalog field-2 dated .zim  $3=field-4  $4=criteria  [$5=local bytes, default 100] -> M8_HIT
     rm -f "$WORK_DIR"/*.zim 2>/dev/null
-    mkzim "$WORK_DIR/$1"          # local_size = 100
+    head -c "${5:-100}" /dev/zero > "$WORK_DIR/$1"
     printf 'pub|%s|https://lb.download.kiwix.org/zim/x/%s|%s\n' "$2" "$2" "$3" > "$LIBRARY_CACHE"
     FILES_TO_UPDATE=()
     UPDATE_CRITERIA="$4" analyze_updates >/dev/null 2>&1
     M8_HIT=no; printf '%s\n' "${FILES_TO_UPDATE[@]}" | grep -qF "$2" && M8_HIT=yes
 }
 
-# --- size arm: direct field-4 vs local_size comparison (NOT size_ratio) ---------
-m8_run "m8s_2025-08.zim" "m8s_2025-09.zim" 200 size
-[ "$M8_HIT" = yes ] && pass "M8 size: field-4 (200) > local (100) => Update needed (in FILES_TO_UPDATE)" || fail "M8 size: 200>100 not flagged"
+# --- size arm: field-4 vs local size rounded up to a whole KiB (NOT size_ratio) --
+m8_run "m8s_2025-08.zim" "m8s_2025-09.zim" 2048 size
+[ "$M8_HIT" = yes ] && pass "M8 size: field-4 (2048) > local (100, 1 KiB) => Update needed (in FILES_TO_UPDATE)" || fail "M8 size: 2048>100 not flagged"
 m8_run "m8s2_2025-08.zim" "m8s2_2025-09.zim" 100 size
 [ "$M8_HIT" = no ] && pass "M8 size: field-4 (100) == local (100) => Up to date (not flagged)" || fail "M8 size: equal size wrongly flagged"
+# The catalog rounds sizes UP to a whole KiB (live: 230348-byte file listed as
+# 230400). An unchanged file must not be re-downloaded on every run.
+for crit in all size; do
+    m8_run m8k_2026-11.zim m8k_2026-11.zim 230400 "$crit" 230348
+    [ "$M8_HIT" = no ] && pass "M8 KiB ($crit): catalog 230400 for a 230348-byte file => up to date" || fail "M8 KiB ($crit): KiB-rounded catalog size flagged an unchanged file"
+    m8_run m8k_2026-11.zim m8k_2026-11.zim 230400 "$crit" 229376
+    [ "$M8_HIT" = yes ] && pass "M8 KiB ($crit): catalog exactly 1 KiB larger (229376 -> 230400) => update needed" || fail "M8 KiB ($crit): a 1 KiB-larger catalog file was not flagged"
+done
 
 # --- size arm "Unknown" (non-numeric field-4 => size_known=false): WARN + no update
 # Membership alone is vacuous here (Unknown 'not updated' == ordinary up-to-date),
@@ -725,7 +819,7 @@ if [ "${KIWIX_LIVE:-0}" = 1 ]; then
       [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] && pass "LIVE .meta4 yields a 64-hex sha-256" || fail "LIVE no sha-256 from $href"
       # F1 assumption check: the .zim must resolve to 200 within ONE redirect
       # (LB -> mirror). A Kiwix-side multi-redirect change would fail-closed under
-      # --max-redirs 1 / --max-redirect=0, breaking every download — catch it here.
+      # curl's --max-redirs 1 resolve, breaking every download — catch it here.
       zurl="${href%.meta4}"
       zcode=$(timeout 30 "$REAL_CURL" -sLI --max-redirs 1 --proto '=http,https' --proto-redir '=http,https' -o /dev/null -w '%{http_code}' "$zurl" 2>/dev/null)
       [ "$zcode" = 200 ] && pass "LIVE .zim resolves 200 within 1 redirect (LB->mirror; F1 budget holds)" || fail "LIVE .zim did not resolve in 1 hop (code=$zcode) — Kiwix may use multi-redirect; revisit --max-redirs"
