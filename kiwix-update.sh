@@ -9,6 +9,7 @@ WORK_DIR="${KIWIX_WORK_DIR:-/var/local/zims}" # where your .zim files live (over
 ZIM_LIBRARY="${KIWIX_ZIM_LIBRARY:-/var/local/library_zim.xml}" # library_zim.xml (override: KIWIX_ZIM_LIBRARY)
 TEMP_DIR="${WORK_DIR}/temp"
 PARTIAL_MAX_AGE_DAYS=14   # resumable partial downloads untouched this long are pruned
+SERVICE_STOP_POLLS=20     # kiwix-serve stop is awaited up to this many 0.5 s polls (>= 10 s)
 BACKUP_DIR="${WORK_DIR}/backups"
 LOG_FILE="${WORK_DIR}/kiwix_update.log"
 STATUS_FILE="${WORK_DIR}/.kiwix_update_status"
@@ -64,6 +65,11 @@ declare -g LIB_BACKED_UP=false
 # The reconcile's in-flight temp copy of the library, removed by cleanup() if the
 # run is killed mid-reconcile (empty when none is in flight).
 declare -g LIB_TEMP=""
+# True while the library may disagree with WORK_DIR (an old ZIM removed or a
+# reconcile in flight): only then does an interrupt suggest 'update-library'.
+# Set by the callers of update_kiwix_library, so no return path inside it has
+# to clear it.
+declare -g LIB_BUSY=false
 
 # Commands checked at preflight so a run fails fast rather than mid-operation.
 # Listed: the core externals (aria2c, kiwix-manage, curl) plus tools whose
@@ -107,12 +113,17 @@ log() {
         printf '[%s] [%s] %s\n' "${timestamp}" "${level}" "${message}" >> "${LOG_FILE}" 2>/dev/null || true
     fi
 
-    # Echo to stdout if not quiet/background
-    if ! ${QUIET} && [ -z "${KIWIX_BACKGROUND:-}" ]; then
+    # Errors go to stderr even under -q. Not once KIWIX_BACKGROUND is set (the -b
+    # child, and the -b parent after it exports it just before redirecting to the
+    # log): stderr is the log file there, which already has the line. `|| true`:
+    # a closed stderr must not abort the run under set -e.
+    if [ -n "${KIWIX_BACKGROUND:-}" ]; then
+        :
+    elif [ "${level}" = "ERROR" ]; then
+        printf 'ERROR: %s\n' "${message}" >&2 || true
+    elif ! ${QUIET}; then
         if [ "${level}" = "DEBUG" ]; then
             ${DEBUG} && printf '%s\n' "${message}"
-        elif [ "${level}" = "ERROR" ]; then
-            printf 'ERROR: %s\n' "${message}" >&2
         else
             printf '%s\n' "${message}"
         fi
@@ -191,7 +202,10 @@ _lib_load() {
 cmd_update_library() {
     stop_service_if_managed || return 1
     local rc=0
+    LIB_BUSY=true
     update_kiwix_library || rc=$?
+    # A refused reconcile (1) leaves the library inconsistent: keep the hint.
+    [ "$rc" -eq 1 ] || LIB_BUSY=false
     restore_service_if_managed
     return "$rc"
 }
@@ -247,6 +261,12 @@ _lib_preflight() {
     return 0
 }
 
+# Remove the reconcile's temp copy of the library (LIB_TEMP), if any, and forget it.
+_lib_temp_discard() {
+    [ -z "${LIB_TEMP}" ] || rm -f -- "${LIB_TEMP}"
+    LIB_TEMP=""
+}
+
 # Update Kiwix library — the SOLE writer of library state. Drops entries for
 # WORK_DIR ZIMs that no longer exist, then adds WORK_DIR ZIMs that are not listed.
 # Entries for ZIMs anywhere else (another disk, a WORK_DIR subdirectory) are not
@@ -258,6 +278,8 @@ _lib_preflight() {
 # removals not applied); 2 if it completed but some kiwix-manage add/remove failed
 # (the ERROR lines name each file — it may be a bystander, not the REFRESH target).
 # Every step checks its own status: callers run this with errexit suspended.
+# Callers set LIB_BUSY=true around this call (and any old-file removal before
+# it) so an interrupt suggests 'update-library'.
 update_kiwix_library() {
     log "INFO" "Updating Kiwix library..."
 
@@ -295,7 +317,8 @@ update_kiwix_library() {
     local removed_count=0 external_count=0 failed_count=0 temp_library i
     temp_library=$(mktemp -p "$(dirname "${ZIM_LIBRARY}")" .library_zim_temp.XXXXXX) || {
         log "ERROR" "Cannot create a temp library — library not modified"; return 1; }
-    LIB_TEMP="$temp_library"   # every later path renames or removes it; cleanup() covers a kill
+    # Every later path renames it or calls _lib_temp_discard; cleanup() covers a kill.
+    LIB_TEMP="$temp_library"
     # Seed the temp from the existing library. A missing or 0-byte library has
     # nothing to copy (the mktemp file is already empty) and must be initialised
     # as an empty <library>: kiwix-manage and kiwix-serve both reject a 0-byte
@@ -307,7 +330,7 @@ update_kiwix_library() {
     # ever deletes a library.
     if [ -s "${ZIM_LIBRARY}" ]; then
         if ! cp "${ZIM_LIBRARY}" "$temp_library"; then
-            rm -f "$temp_library"; LIB_TEMP=""
+            _lib_temp_discard
             log "ERROR" "Cannot copy ${ZIM_LIBRARY} — library not modified"
             return 1
         fi
@@ -319,10 +342,11 @@ update_kiwix_library() {
         fi
         if ! { printf '<library version="20110515">\n</library>\n' > "$temp_library" &&
                chmod 644 "$temp_library" && mv "$temp_library" "${ZIM_LIBRARY}"; }; then
-            rm -f "$temp_library"; LIB_TEMP=""
+            _lib_temp_discard
             log "ERROR" "Cannot create ${ZIM_LIBRARY} — library not modified"
             return 1
         fi
+        LIB_TEMP=""   # renamed into place: nothing left for cleanup() to remove
     fi
     for i in "${!lib_paths[@]}"; do
         p="${lib_paths[$i]}"
@@ -350,19 +374,19 @@ update_kiwix_library() {
         # kiwix-manage "succeeded" yet left nothing: never install that, and
         # never pretend the removals happened (refreshed files would be
         # re-added next to their stale entries).
-        rm -f "$temp_library"; LIB_TEMP=""
+        _lib_temp_discard
         log "ERROR" "kiwix-manage left an empty temp library — removals not applied, library not modified"
         return 1
     elif [ "$removed_count" -gt 0 ]; then
         if ! { chmod 644 "$temp_library" && mv "$temp_library" "${ZIM_LIBRARY}"; }; then
-            rm -f "$temp_library"; LIB_TEMP=""
+            _lib_temp_discard
             log "ERROR" "Cannot replace ${ZIM_LIBRARY} — removals not applied"
             return 1
         fi
+        LIB_TEMP=""   # renamed into place: nothing left for cleanup() to remove
     else
-        rm -f "$temp_library"   # (already gone if the library was just initialised)
+        _lib_temp_discard   # (already gone if the library was just initialised)
     fi
-    LIB_TEMP=""
 
     local found_files=() file_path filename added_count=0
     while IFS= read -r -d '' file_path; do
@@ -677,12 +701,10 @@ cleanup() {
     fi
 
     # A reconcile's temp copy of the library (set only while one is in flight).
-    if [ -n "${LIB_TEMP:-}" ]; then
-        rm -f -- "${LIB_TEMP}"
-    fi
+    _lib_temp_discard
 
-    if [ -n "${1:-}" ]; then
-        log "WARN" "Interrupted — if a library update was in progress, run 'update-library'"
+    if [ -n "${1:-}" ] && ${LIB_BUSY}; then
+        log "WARN" "Interrupted during a library update — run 'update-library'"
     fi
     # Never leave kiwix-serve down because the run ended (or was signalled) after
     # stopping it: the .kiwix_was_running marker is the single record of that, and
@@ -729,7 +751,8 @@ Options:
                         exits non-zero; a library that cannot be written still
                         stops the run)
    -b                   Run in background
-   -q                   Quiet mode
+   -q                   Quiet: hide progress, info and warnings (errors and the
+                        safety warnings still go to stderr)
    -v                   Verbose/debug mode
    -p:[NUM]             Parallel connections (1-50)
    -m:[NUM[M|K]]        Max download speed
@@ -903,13 +926,20 @@ manage_kiwix_service() {
 
     case "$action" in
         stop)
+            # Poll (bounded by a count, not a clock): a sysvinit stop can take
+            # longer than a fixed wait. Start keeps its fixed settle below, which
+            # also catches a kiwix-serve that starts and then dies at once.
             log "INFO" "Stopping Kiwix service"
             if _kiwix_service_do stop; then
-                sleep 2
-                if ! _kiwix_service_active; then
-                    log "INFO" "Kiwix service stopped"
-                    return 0
-                fi
+                local n=0
+                while [ "$n" -lt "$SERVICE_STOP_POLLS" ]; do
+                    sleep 0.5
+                    if ! _kiwix_service_active; then
+                        log "INFO" "Kiwix service stopped"
+                        return 0
+                    fi
+                    n=$((n + 1))
+                done
             fi
             log "ERROR" "Failed to stop Kiwix service"
             return 1
@@ -956,9 +986,10 @@ _kiwix_serve_running() {
 }
 
 # Announce that the running-server safety guard was overridden. Emitted to the
-# REAL stderr with printf — NOT via log(), whose console output is gated behind
-# `! ${QUIET}`; -b sets QUIET, so a log()-only warning would be buried in the log
-# file and the operator would never see that the guard was bypassed.
+# REAL stderr with printf — NOT via log(), whose WARN/INFO console output is gated
+# behind `! ${QUIET}` (only ERROR bypasses it); -b sets QUIET, so a log()-only
+# warning would be buried in the log file and the operator would never see that
+# the guard was bypassed.
 _warn_serving_override() {
     printf 'WARNING: %s; proceeding anyway (-y). Updated files may be served inconsistently until kiwix-serve is restarted.\n' "$1" >&2
     log "WARN" "Serving guard overridden: $1; proceeding (-y)."
@@ -2010,7 +2041,6 @@ do_smart_update() {
             log "WARN" "Skipping entry with unsafe name: '${new_name}'"
             total_failed=$((total_failed + 1))
             if ! $CONTINUE_ON_ERROR; then
-                update_success=false
                 break
             fi
             continue
@@ -2032,7 +2062,6 @@ do_smart_update() {
                     log "ERROR" "Not enough space for ${new_name}.zim"
                     total_failed=$((total_failed + 1))
                     if ! $CONTINUE_ON_ERROR; then
-                        update_success=false
                         break
                     fi
                     continue
@@ -2062,12 +2091,15 @@ do_smart_update() {
             log "ERROR" "Failed to update ${filename}"
             total_failed=$((total_failed + 1))
             if ! $CONTINUE_ON_ERROR; then
-                update_success=false
                 break
             fi
         else
             total_updated=$((total_updated + 1))
-            
+            # From here until the reconcile returns, the library may list a
+            # removed old file (or a replaced book's stale UUID). The install mv
+            # inside download_file, just before, is outside this window (accepted).
+            LIB_BUSY=true
+
             if [ "$f" != "$new_filepath" ] && [ -f "$f" ]; then
                 log "INFO" "Transitioning from $filename to ${new_name}.zim"
                 log "INFO" "Removing old file: $filename"
@@ -2081,6 +2113,8 @@ do_smart_update() {
             # refreshing an unlisted file is just an add.
             local rec_rc=0
             update_kiwix_library "$new_filepath" || rec_rc=$?
+            # A refused reconcile (1) leaves the library inconsistent: keep the hint.
+            [ "$rec_rc" -eq 1 ] || LIB_BUSY=false
             if [ "$rec_rc" -eq 2 ]; then
                 # Reconcile ran; some kiwix-manage operation failed (possibly on an
                 # unrelated file — the ERROR above names it). Downloads are
@@ -2255,10 +2289,11 @@ clean_state() {
     # stopped. Safe to clear here: clean_state runs under the run lock before
     # command dispatch, so only a stale marker is removed; the legitimate marker
     # is written later by stop_service_if_managed. A stale one means a previous
-    # run was killed after stopping kiwix-serve — say so rather than drop it silently.
-    if [ -f "${WORK_DIR}/.kiwix_was_running" ]; then
-        log "WARN" "A previous run stopped kiwix-serve and did not restart it — start it if it should be running"
-    fi
+    # run was killed after stopping kiwix-serve, so kiwix-serve may be down: note
+    # it, wipe the state (the log included), then warn into the fresh log, and on
+    # stderr under -q.
+    local stale_marker=false
+    [ -f "${WORK_DIR}/.kiwix_was_running" ] && stale_marker=true
     rm -f "${WORK_DIR}"/.kiwix_update* \
           "${WORK_DIR}"/.kiwix_was_running \
           "${WORK_DIR}"/kiwix_update.log* \
@@ -2266,7 +2301,14 @@ clean_state() {
           "${WORK_DIR}"/.progress \
           "${STATUS_FILE}" \
           "${LIBRARY_CACHE}" 2>/dev/null || true
-    
+    if $stale_marker; then
+        local msg="A previous run stopped kiwix-serve and did not restart it — start it if it should be running"
+        log "WARN" "$msg"
+        if ${QUIET}; then
+            printf 'WARNING: %s\n' "$msg" >&2
+        fi
+    fi
+
     # Clear the temp directory, keeping recent resumable partials unless "full".
     if [ "${1:-}" = full ]; then
         rm -rf "${TEMP_DIR}" 2>/dev/null || true
@@ -2550,6 +2592,8 @@ main() {
             LOGFILE_SAFE=true
             acquire_run_lock || exit 1   # never wipe a live run's state
             clean_state full
+            # Only a stale-marker warning can have been logged since the wipe.
+            _restrict_state_file "${LOG_FILE}"
             echo "All logs, state files and partial downloads cleared"
             exit 0
             ;;

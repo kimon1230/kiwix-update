@@ -161,7 +161,7 @@ sudo ./kiwix-update.sh clean
 ```bash
 -y                   Non-interactive mode
 -b                   Background execution
--q                   Suppress output
+-q                   Quiet: hide progress, info and warnings (errors and the safety warnings still go to stderr)
 -v                   Verbose logging
 -c                   Continue past per-file download errors (still exits non-zero; never past an unwritable library)
 -p:[NUM]             Parallel connections (1-50)
@@ -224,7 +224,7 @@ If a library operation fails (e.g. `kiwix-manage` rejects a ZIM), the update con
 
 Only one run at a time: `check-updates`, `smart-update`, `update-library` and `clean` take an exclusive lock (`.kiwix_run.lock` in the working directory, via `flock`) before touching any state, and a second run is refused with "Another kiwix-update run is in progress" instead of interfering. A `-b` run keeps the lock until the background process finishes. When upgrading from a version without the lock, let any running `-b` update finish (or stop it) first: the new `stop` recognises a run only by the lock it holds. `stop` takes no lock; it signals the background run together with its download, so nothing is left running.
 
-If a run is interrupted (SIGTERM, Ctrl-C, SIGHUP) after it stopped `kiwix-serve`, it restarts the service before exiting, and exits with 143/130/129 so cron and systemd see the failure. Run `update-library` afterwards if a library update was in progress.
+If a run is interrupted (SIGTERM, Ctrl-C, SIGHUP) after it stopped `kiwix-serve`, it restarts the service before exiting, and exits with 143/130/129 so cron and systemd see the failure. If the interruption came during a library update, the log says so ("Interrupted during a library update"); run `update-library` in that case.
 
 ### Exit codes
 
@@ -275,7 +275,7 @@ The script checks its required commands before doing anything and names any that
 Another run holds the lock. With a PID in the message it is a background run: check it with `status`, or end it with `stop`. Otherwise it is a foreground run or a `clean`. Wait for it to finish; the lock is released automatically when the process exits, even if it crashes.
 
 **Run was interrupted (Ctrl-C, SIGTERM, `stop`):**
-kiwix-serve is restarted if the run had stopped it. Files that finished downloading are installed and listed in the library. Run `update-library` if the interruption came during a library update.
+kiwix-serve is restarted if the run had stopped it. Files that finished downloading are installed and listed in the library. If the log says "Interrupted during a library update", run `update-library`.
 
 **`kiwix-serve` says it cannot read the library:**
 Run `sudo ./kiwix-update.sh update-library`. It rebuilds a missing or empty library from the ZIMs in the working directory.
@@ -366,7 +366,7 @@ This project is released under the MIT License. See LICENSE file for full terms.
 
 Contributions are welcome. Please test thoroughly on non-production systems before submitting changes. The script is designed for educational and institutional use cases.
 
-Every push and pull request runs ShellCheck (pinned v0.10.0), the offline test suites in `tests/`, and a gitleaks secret scan of the full git history in CI; the badge at the top shows the latest result on `main`. Run them locally with `for t in tests/*.sh; do bash "$t"; done`.
+Every push and pull request runs ShellCheck (pinned v0.10.0), actionlint on the CI workflow itself, the offline test suites in `tests/`, and a gitleaks secret scan of the full git history in CI; the badge at the top shows the latest result on `main`. Run them locally with `for t in tests/*.sh; do bash "$t"; done`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, how to run the test suites, the ShellCheck gate, and the conventions for writing tests and preserving the root/unprivileged run-mode invariant.
 

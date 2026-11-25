@@ -323,7 +323,7 @@ HTTPS_ONLY=true YES_TO_ALL=true EFFECTIVE_URL="https://m.invalid/f.zim" MIRROR_S
   download_file "https://lb.download.kiwix.org/zim/x/o.zim" "$WORK_DIR/c5sh.zim" 100 >/dev/null 2>&1
 grep -q 'aria2c ' "$ARIA_LOG" && pass "C5 strict https: https mirror allowed (aria2c invoked)" || fail "C5 strict https: aria2c not invoked"
 # aria2c failure is diagnosable in both modes: its exit code and its error lines
-# are logged (quiet = -q/-b/cron) and, when not quiet, also shown on stderr.
+# are logged, and shown on stderr even when quiet (-q).
 for c5e_quiet in true false; do
     : > "$LOG_FILE"
     c5e_err=$(LOGFILE_SAFE=true QUIET=$c5e_quiet STUB_ARIA_RC=28 STUB_ARIA_MSG="aria2c: unrecognized option '--bogus'" \
@@ -332,11 +332,12 @@ for c5e_quiet in true false; do
     c5e_ok=true
     grep -q 'Download failed for c5e.zim (aria2c exit 28)' "$LOG_FILE" || c5e_ok=false
     grep -q "aria2c: aria2c: unrecognized option '--bogus'" "$LOG_FILE" || c5e_ok=false
-    if [ "$c5e_quiet" = false ]; then
-        grep -q "unrecognized option '--bogus'" <<<"$c5e_err" || c5e_ok=false
-    fi
+    grep -q "unrecognized option '--bogus'" <<<"$c5e_err" || c5e_ok=false
+    grep -q 'ERROR: Download failed for c5e.zim (aria2c exit 28)' <<<"$c5e_err" || c5e_ok=false
+    # Exactly once (no duplicate when not quiet).
+    [ "$(grep -c 'Download failed for c5e.zim' <<<"$c5e_err")" -eq 1 ] || c5e_ok=false
     $c5e_ok \
-      && pass "C5e aria2c failure (quiet=$c5e_quiet): exit code and error line logged" \
+      && pass "C5e aria2c failure (quiet=$c5e_quiet): exit code and error line logged and on stderr once" \
       || fail "C5e aria2c failure not surfaced (quiet=$c5e_quiet) log: $(tr '\n' ' ' < "$LOG_FILE" | head -c 200) stderr: ${c5e_err:0:120}"
 done
 # resolve failure: WARN + return 1, aria2c never invoked
@@ -1006,9 +1007,11 @@ if $r4_ok && [ "$(ps -o pgid= -p "$R_PID" | tr -d ' ')" = "$R_PID" ]; then
     : > "$RT/x.meta4"
     kill -TERM -- -"$R_PID"
     wait "$R_PID"; r4_rc=$?
-    { [ "$r4_rs" = y ] && [ "$r4_rc" -eq 143 ] && [ "$(r_pair)" = yy ] && [ ! -e "$RS" ] && [ ! -e "$RT/x.meta4" ]; } \
-      && pass "R4 SIGTERM: pair kept for resume; cleanup ran (status file and .meta4 removed, exit 143)" \
-      || fail "R4 SIGTERM: status-before=$r4_rs rc=$r4_rc pair=$(r_pair) status-after=$(r_has "$RS") meta4=$(r_has "$RT/x.meta4")"
+    # A signal mid-download leaves the library consistent: no 'update-library' hint.
+    { [ "$r4_rs" = y ] && [ "$r4_rc" -eq 143 ] && [ "$(r_pair)" = yy ] && [ ! -e "$RS" ] && [ ! -e "$RT/x.meta4" ] \
+        && [ -s "$RLOG" ] && ! grep -q Interrupted "$RLOG"; } \
+      && pass "R4 SIGTERM: pair kept for resume; cleanup ran (status file and .meta4 removed, exit 143); no library hint" \
+      || fail "R4 SIGTERM: status-before=$r4_rs rc=$r4_rc pair=$(r_pair) status-after=$(r_has "$RS") meta4=$(r_has "$RT/x.meta4") log-nonempty=$([ -s "$RLOG" ] && echo y || echo n) hint=$(grep -c Interrupted "$RLOG" 2>/dev/null)"
 else
     kill -KILL -- -"$R_PID" 2>/dev/null || kill -KILL "$R_PID" 2>/dev/null
     wait "$R_PID"

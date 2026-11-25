@@ -22,6 +22,11 @@ jobs:
     env:
       SHELLCHECK_VERSION: v0.10.0
       SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+      # Manual bump: set the version, then take the sha256 of
+      # actionlint_<ver>_linux_amd64.tar.gz from that release's actionlint_<ver>_checksums.txt
+      # (copy it from the release page; never compute it from the downloaded tarball).
+      ACTIONLINT_VERSION: 1.7.7
+      ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
     steps:
       # Pinned to a full commit SHA (not the mutable @v4 tag) to prevent tag
       # hijack from running attacker code in CI. Verify/refresh via Dependabot.
@@ -41,6 +46,21 @@ jobs:
           tar -xJf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
           sudo install -m 0755 "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
           shellcheck --version
+      # Exact release, hash-verified (same pattern as shellcheck above).
+      - name: Install actionlint (pinned + hash-verified)
+        run: |
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" actionlint
+          sudo install -m 0755 "$RUNNER_TEMP/actionlint" /usr/local/bin/actionlint
+          actionlint -version
+      # Lints this workflow itself: expressions, action inputs, and every run:
+      # block through the pinned shellcheck (not whichever one is first on PATH).
+      - name: actionlint
+        # test -x: actionlint silently disables its shellcheck rule if the path is missing.
+        run: test -x /usr/local/bin/shellcheck && actionlint -shellcheck=/usr/local/bin/shellcheck
       - name: Syntax check
         run: |
           bash -n kiwix-update.sh
@@ -86,6 +106,9 @@ jobs:
       # assertion only holds as non-root. A root/container runner would break it.
       - name: Run test suites
         run: |
+          # SKIP_E2E skips the end-to-end resume cases (only verify_c1_sensitivity.sh
+          # sets it, for its own inner run). Inherited here it would hide them.
+          [ -z "${SKIP_E2E:-}" ] || { echo "SKIP_E2E is set in CI — refusing to skip the end-to-end tests" >&2; exit 1; }
           for t in tests/*.sh; do
             echo "=== $t ==="
             bash "$t" || exit 1

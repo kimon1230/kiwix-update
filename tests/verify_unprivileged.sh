@@ -364,6 +364,26 @@ rc=$?
 { [ "$rc" -eq 143 ] && [ "$(grep -cx 'do start' "$WDM/calls")" -eq 1 ] && [ ! -e "$WDM/.kiwix_was_running" ]; } \
   && pass "B3.9c SIGTERM during the service stop: still restarted exactly once (marker written before the stop)" \
   || fail "B3.9c rc=$rc calls: $(tr '\n' ',' < "$WDM/calls" 2>/dev/null) out: $(tail -2 "$WDM/out" | tr '\n' ' ')"
+# B3.9d: stop is awaited by polling (a sysvinit stop can outlast a fixed 2 s).
+# The REAL manage_kiwix_service; the primitives count status polls in-shell.
+stop_poll_case(){ # $1 = status poll from which the service reads inactive, or "never"
+    INACTIVE_AT="$1" in_script '
+        sleep(){ :; }
+        polls=0
+        _kiwix_service_do(){ return 0; }
+        _kiwix_service_active(){ polls=$((polls + 1))
+            [ "$INACTIVE_AT" = never ] || [ "$polls" -lt "$INACTIVE_AT" ]; }
+        rc=0; manage_kiwix_service stop || rc=$?
+        echo "RC=$rc POLLS=$polls MAX=$SERVICE_STOP_POLLS"' 2>&1
+}
+out=$(stop_poll_case 3)
+grep -qE '^RC=0 POLLS=3 MAX=([4-9]|[1-9][0-9]+)$' <<< "$out" \
+  && pass "B3.9d stop that settles on the 3rd poll: success, polling stops there" \
+  || fail "B3.9d settle-on-3: $(tr '\n' ' ' <<< "$out")"
+out=$(stop_poll_case never)
+{ grep -qE '^RC=1 POLLS=([0-9]+) MAX=\1$' <<< "$out" && [ "$(grep -c 'Failed to stop Kiwix service' <<< "$out")" -eq 1 ]; } \
+  && pass "B3.9d stop that never takes effect: fails once after SERVICE_STOP_POLLS polls (bounded)" \
+  || fail "B3.9d never-stops: $(tr '\n' ' ' <<< "$out")"
 svc_case true; r="$SVC_CALLS"
 [ -z "$r" ] \
   && pass "B3.10 unpriv: update-library does NOT touch kiwix-serve" \
@@ -779,6 +799,40 @@ KIWIX_WORK_DIR="$WDC" in_script 'clean_state' >/dev/null 2>&1
 [ ! -e "$WDC/.kiwix_was_running" ] \
   && pass "CR1.1 clean_state clears stale .kiwix_was_running marker" \
   || fail "CR1.1 .kiwix_was_running survived clean_state"
+# CR1.2: the stale-marker warning (kiwix-serve may be down) survives clean_state's
+# own log wipe, and reaches stderr under -q.
+stale_marker_case(){ # $1 = QUIET value; leaves $WDC/{o,e} = stdout/stderr
+    touch "$WDC/.kiwix_was_running"; echo "OLD-LINE" > "$WDC/kiwix_update.log"
+    KIWIX_WORK_DIR="$WDC" Q="$1" in_script 'QUIET=$Q; LOGFILE_SAFE=true; clean_state' >"$WDC/o" 2>"$WDC/e"
+}
+CR_MSG='A previous run stopped kiwix-serve and did not restart it'
+stale_marker_case true
+{ grep -q "$CR_MSG" "$WDC/e" && grep -q "$CR_MSG" "$WDC/kiwix_update.log" && ! grep -q OLD-LINE "$WDC/kiwix_update.log"; } \
+  && pass "CR1.2 -q: stale-marker warning on stderr and in the fresh log (old log wiped)" \
+  || fail "CR1.2 -q: stderr='$(cat "$WDC/e")' log='$(cat "$WDC/kiwix_update.log" 2>/dev/null)'"
+stale_marker_case false
+{ grep -q "$CR_MSG" "$WDC/o" && ! grep -q "$CR_MSG" "$WDC/e"; } \
+  && pass "CR1.2 not quiet: warning on stdout only (no stderr duplicate)" \
+  || fail "CR1.2 not quiet: stdout='$(cat "$WDC/o")' stderr='$(cat "$WDC/e")'"
+# Q1: which stream each log level reaches. Every case captures stdout and
+# stderr separately ("O:<stdout>|E:<stderr>"), so a leak on either is caught.
+#   -q:      ERROR on stderr only; INFO/WARN/DEBUG print nothing at all.
+#   not -q:  ERROR on stderr only (no stdout duplicate).
+#   -b child: nothing (its stdout/stderr are the log file already).
+q1(){ # $1 = QUIET value, $2 = body
+    local o e
+    o=$(mktemp "$ROOT/q1o.XXXXXX"); e=$(mktemp "$ROOT/q1e.XXXXXX")
+    Q="$1" in_script "QUIET=\$Q; LOGFILE_SAFE=false; $2" >"$o" 2>"$e"
+    printf 'O:%s|E:%s' "$(cat "$o")" "$(cat "$e")"; rm -f "$o" "$e"
+}
+q1_err=$(q1 true 'log ERROR boom')
+q1_quiet=$(q1 true 'DEBUG=true; log INFO hi; log WARN w; log DEBUG d')
+q1_loud=$(q1 false 'log ERROR boom')
+q1_bg=$(q1 true 'KIWIX_BACKGROUND=1; log ERROR boom')
+{ [ "$q1_err" = 'O:|E:ERROR: boom' ] && [ "$q1_quiet" = 'O:|E:' ] \
+    && [ "$q1_loud" = 'O:|E:ERROR: boom' ] && [ "$q1_bg" = 'O:|E:' ]; } \
+  && pass "Q1 log streams: -q errors on stderr only; info/warn/debug silent; not -q errors on stderr once; -b child silent" \
+  || fail "Q1 log streams: err='$q1_err' quiet='$q1_quiet' loud='$q1_loud' bg='$q1_bg'"
 
 echo
 [ "$FAIL" -eq 0 ] && echo "==== ALL UNPRIVILEGED CHECKS PASSED ====" || echo "==== SOME UNPRIVILEGED CHECKS FAILED ===="

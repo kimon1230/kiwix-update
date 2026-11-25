@@ -64,6 +64,14 @@ shellcheck --severity=warning --exclude=SC2155 kiwix-update.sh
 the only excluded code. The same gate is applied to **every** `tests/*.sh`
 harness.
 
+CI also runs [actionlint](https://github.com/rhysd/actionlint) **v1.7.7**
+(pinned + hash-verified) on `.github/workflows/`, which checks the workflow and
+ShellChecks every `run:` block. Locally:
+
+```bash
+sc=$(command -v shellcheck) && actionlint -shellcheck="$sc"   # fails if shellcheck is missing
+```
+
 ### Test-harness ShellCheck convention
 
 A harness that `source`s the script under test trips two false positives that

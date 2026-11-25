@@ -15,6 +15,8 @@ id_ed25519*
 .netrc
 credentials*.json
 service-account*.json
+*.secret
+*.gpg
 
 # Local tooling / editor / OS artifacts
 .claude/
