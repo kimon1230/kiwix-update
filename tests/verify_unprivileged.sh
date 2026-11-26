@@ -305,6 +305,7 @@ svc_case(){ # $1=UNPRIVILEGED(true/false) [$2=update_kiwix_library body]
     local WD LOG
     WD=$(mktemp -d "$ROOT/svc.XXXXXX"); LOG="$WD/svc.calls"; : > "$LOG"; SVC_WD="$WD"
     KIWIX_WORK_DIR="$WD" SVC_LOG="$LOG" KSERVE_RUNNING=0 MODE="$1" UKL="${2:-return 0}" PATH="$PID_PATH" in_script '
+        if [ -n "${SVC_CLOSE_STDOUT:-}" ]; then exec >&-; fi
         determine_run_mode(){ UNPRIVILEGED="$MODE"; EXPECTED_OWNER_UID=0; RUN_UID=0; }
         ensure_trusted_dirs(){ return 0; }
         check_dependencies(){ return 0; }
@@ -343,6 +344,13 @@ for sig_rc in INT:130 HUP:129; do
       && pass "B3.9b SIG${sig_rc%%:*}: restarted once, rc ${sig_rc##*:}" \
       || fail "B3.9b SIG${sig_rc%%:*} rc=$SVC_RC calls: $(tr '\n' ',' <<< "$r")"
 done
+# B3.9e: SIGHUP from a dropped SSH session, whose terminal is gone, so every
+# stdout write fails. Under set -e a failing log() printf aborted cleanup before
+# the restore, leaving kiwix-serve down. A closed stdout stands in for the dead tty.
+SVC_CLOSE_STDOUT=1 svc_case false 'kill -HUP $$'; r="$SVC_CALLS"
+{ [ "$SVC_RC" -eq 129 ] && [ "$(grep -cx start <<< "$r")" -eq 1 ] && [ ! -e "$SVC_WD/.kiwix_was_running" ]; } \
+  && pass "B3.9e SIGHUP with stdout gone: still restarted once, rc 129, marker cleared" \
+  || fail "B3.9e rc=$SVC_RC calls: $(tr '\n' ',' <<< "$r") out: $(tail -3 "$SVC_WD/out" | tr '\n' ' ')"
 # B3.9c: the signal arrives DURING the stop (bash defers the trap until the
 # stop command returns). REAL manage_kiwix_service/stop_service_if_managed; only
 # the service-manager primitives are stubbed. The marker must already exist.

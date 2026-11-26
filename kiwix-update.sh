@@ -115,21 +115,19 @@ log() {
 
     # Errors go to stderr even under -q. Not once KIWIX_BACKGROUND is set (the -b
     # child, and the -b parent after it exports it just before redirecting to the
-    # log): stderr is the log file there, which already has the line. `|| true`:
-    # a closed stderr must not abort the run under set -e.
+    # log): stderr is the log file there, which already has the line. `|| true` on
+    # every console write: a closed stdout/stderr (an SSH session that dropped
+    # mid-run) must not abort the run under set -e — inside cleanup that would
+    # skip the service restore.
     if [ -n "${KIWIX_BACKGROUND:-}" ]; then
         :
     elif [ "${level}" = "ERROR" ]; then
         printf 'ERROR: %s\n' "${message}" >&2 || true
     elif ! ${QUIET}; then
-        if [ "${level}" = "DEBUG" ]; then
-            ${DEBUG} && printf '%s\n' "${message}"
-        else
-            printf '%s\n' "${message}"
+        if [ "${level}" != "DEBUG" ] || ${DEBUG}; then
+            printf '%s\n' "${message}" || true
         fi
     fi
-    # Explicit success: the DEBUG arm ends in `${DEBUG} && printf`, which would
-    # otherwise return 1 when DEBUG=false and abort a bare caller under set -e.
     return 0
 }
 
@@ -687,11 +685,23 @@ cleanup() {
     if [ "${BACKGROUND}" = "true" ] && [ -z "${KIWIX_BACKGROUND:-}" ]; then
         exit "$exit_code"
     fi
-    
+
+    # Never leave kiwix-serve down because the run ended (or was signalled) after
+    # stopping it: the .kiwix_was_running marker is the single record of that, and
+    # restore is a no-op without it. Restore first, before any other cleanup step
+    # (or console output) can fail or stall in between. A no-op handler (NOT
+    # trap '': SIG_IGN is inherited across exec, so systemctl/service and a
+    # sysvinit-started kiwix-serve would ignore SIGTERM) keeps a second Ctrl-C from
+    # aborting the restart sequence (a child it hits directly can still die).
+    if [ -f "${WORK_DIR}/.kiwix_was_running" ]; then
+        trap ':' INT TERM HUP
+        restore_service_if_managed
+    fi
+
     if [ -z "${KIWIX_BACKGROUND:-}" ] && ! ${QUIET}; then
         log "INFO" "Cleaning up..."
     fi
-    
+
     # Remove our own PID file, ownership-gated (via read_trusted_pid, which
     # rejects symlinks/non-root/non-numeric) so we never delete another run's or
     # follow a planted symlink (e.g. a foreground run must not clobber a live
@@ -705,17 +715,6 @@ cleanup() {
 
     if [ -n "${1:-}" ] && ${LIB_BUSY}; then
         log "WARN" "Interrupted during a library update — run 'update-library'"
-    fi
-    # Never leave kiwix-serve down because the run ended (or was signalled) after
-    # stopping it: the .kiwix_was_running marker is the single record of that, and
-    # restore is a no-op without it. Restore before pruning TEMP_DIR so a slow
-    # rm -rf cannot delay the service. A no-op handler (NOT trap '': SIG_IGN is
-    # inherited across exec, so systemctl/service and a sysvinit-started
-    # kiwix-serve would ignore SIGTERM) keeps a second Ctrl-C from aborting the
-    # restart sequence (a child it hits directly can still die).
-    if [ -f "${WORK_DIR}/.kiwix_was_running" ]; then
-        trap ':' INT TERM HUP
-        restore_service_if_managed
     fi
 
     # Clean up transient files if not in background mode (resumable partials stay)
