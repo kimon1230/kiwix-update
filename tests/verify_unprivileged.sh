@@ -26,6 +26,7 @@ MSG_PREPLANT="pre-plant"                       # absent-leaf symlink/file error
 MSG_CHOWN_ROOT="chown root"                    # root-mode remediation (must NOT appear unpriv)
 MSG_KIWIX_WORK_DIR="KIWIX_WORK_DIR"            # unprivileged remediation hint
 MSG_FAILED_RESTORE="Failed to restore"         # restore start-failure
+MSG_COULD_NOT_STOP_RELOAD="Could not stop kiwix-serve to reload"   # -b end-of-run restart: stop failed
 MSG_WARNING="WARNING"                          # any visible serving-guard override warning
 MSG_WARNING_KIWIX="WARNING: kiwix-serve"       # the running-server override warning specifically
 MSG_SYMLINK="symlink"                          # trust-gate symlink rejection
@@ -316,7 +317,8 @@ svc_case(){ # $1=UNPRIVILEGED(true/false) [$2=update_kiwix_library body]
         # Only logs calls: the REAL stop_service_if_managed writes the
         # .kiwix_was_running marker (before the stop), so restore depends on it.
         manage_kiwix_service(){ printf "%s\n" "$1" >> "$SVC_LOG"
-            [ "$1" = start ] && bash -c "grep ^SigIgn: /proc/self/status" >> "$SVC_LOG"; return 0; }
+            [ "$1" = start ] && bash -c "grep ^SigIgn: /proc/self/status" >> "$SVC_LOG"
+            [ "$1" = start ] && return "${START_RC:-0}"; return 0; }
         main update-library -y' > "$WD/out" 2>&1
     SVC_RC=$?
     SVC_CALLS=$(cat "$LOG")
@@ -351,6 +353,18 @@ SVC_CLOSE_STDOUT=1 svc_case false 'kill -HUP $$'; r="$SVC_CALLS"
 { [ "$SVC_RC" -eq 129 ] && [ "$(grep -cx start <<< "$r")" -eq 1 ] && [ ! -e "$SVC_WD/.kiwix_was_running" ]; } \
   && pass "B3.9e SIGHUP with stdout gone: still restarted once, rc 129, marker cleared" \
   || fail "B3.9e rc=$SVC_RC calls: $(tr '\n' ',' <<< "$r") out: $(tail -3 "$SVC_WD/out" | tr '\n' ' ')"
+# BR5: the restart FAILS during a signalled cleanup. cleanup runs under errexit, so
+# a non-zero restore must not abort it: still rc 143, marker cleared. (Guards the
+# `|| true` at the cleanup call; passes pre-fix, when restore always returned 0.)
+START_RC=1 svc_case false 'kill -TERM $$'; r="$SVC_CALLS"
+{ [ "$SVC_RC" -eq 143 ] && [ "$(grep -cx start <<< "$r")" -eq 1 ] && [ ! -e "$SVC_WD/.kiwix_was_running" ]; } \
+  && pass "BR5 SIGTERM + failed restart: cleanup completes (rc 143, marker cleared)" \
+  || fail "BR5 rc=$SVC_RC calls: $(tr '\n' ',' <<< "$r")"
+# BR6: update-library whose restart fails reports failure (the server was left down).
+START_RC=1 svc_case false; r="$SVC_CALLS"
+{ [ "$SVC_RC" -eq 1 ] && [ "$(grep -cx start <<< "$r")" -eq 1 ]; } \
+  && pass "BR6 update-library: failed restart fails the run (rc 1)" \
+  || fail "BR6 rc=$SVC_RC calls: $(tr '\n' ',' <<< "$r")"
 # B3.9c: the signal arrives DURING the stop (bash defers the trap until the
 # stop command returns). REAL manage_kiwix_service/stop_service_if_managed; only
 # the service-manager primitives are stubbed. The marker must already exist.
@@ -641,19 +655,22 @@ r=$(svc_helper restore_service_if_managed false no no)
 [ -z "$r" ] && pass "B3.17 root + no marker: restore_service_if_managed is a no-op" || fail "B3.17 got '$r'"
 r=$(svc_helper restore_service_if_managed true yes no)
 [ -z "$r" ] && pass "B3.18 unpriv: restore_service_if_managed is a no-op even with marker" || fail "B3.18 got '$r'"
-# B3.18b root + marker + start FAILS -> logs the error and clears the marker (no abort).
+# B3.18b root + marker + start FAILS -> logs the error, clears the marker and
+# returns non-zero (callers fail the run: the server was left down).
 WD=$(mktemp -d "$ROOT/svcr.XXXXXX"); touch "$WD/.kiwix_was_running"
 out=$(KIWIX_WORK_DIR="$WD" in_script '
     UNPRIVILEGED=false; LOGFILE_SAFE=false; QUIET=false
     manage_kiwix_service(){ [ "$1" = start ] && return 1; return 0; }
-    restore_service_if_managed' 2>&1)
-{ printf '%s' "$out" | grep -qi "$MSG_FAILED_RESTORE" && [ ! -f "$WD/.kiwix_was_running" ]; } \
-  && pass "B3.18b root: restore start-failure logs the error and clears the marker" || fail "B3.18b got '$out' (marker: $([ -f "$WD/.kiwix_was_running" ] && echo present || echo cleared))"
+    restore_service_if_managed' 2>&1); rr=$?
+{ printf '%s' "$out" | grep -qi "$MSG_FAILED_RESTORE" && [ ! -f "$WD/.kiwix_was_running" ] && [ "$rr" -ne 0 ]; } \
+  && pass "B3.18b root: restore start-failure logs the error, clears the marker, returns non-zero" || fail "B3.18b rc=$rr got '$out' (marker: $([ -f "$WD/.kiwix_was_running" ] && echo present || echo cleared))"
 
 # --- do_smart_update stop CALL SITE (drives the real function, not just helper) -
 # Covers the "Cannot proceed" error wrapper and the KIWIX_BACKGROUND skip that is
 # unique to smart-update. is_safe_zim_name->1 makes the download loop a no-op.
-dsu(){ # $1=bg(yes/no) $2=stop_rc [$3=preflight_rc] -> log (PREFLIGHT/STOP/RESTORE/rc + stderr)
+dsu(){ # $1=bg(yes/no) $2=stop_rc [$3=preflight_rc] -> log (PREFLIGHT/DL/STOP/RESTORE/rc + stderr)
+    # Env: DSU_INSTALL=1 -> two entries download and install (logs DL each);
+    #      RESTORE_RC -> restore_service_if_managed's return code (default 0).
     local WD LOG bg=""
     WD=$(mktemp -d "$ROOT/dsu.XXXXXX"); LOG="$WD/log"; : > "$LOG"
     [ "$1" = yes ] && bg=1
@@ -663,8 +680,15 @@ dsu(){ # $1=bg(yes/no) $2=stop_rc [$3=preflight_rc] -> log (PREFLIGHT/STOP/RESTO
         update_status(){ :; }; update_progress(){ :; }; backup_library_xml(){ :; }
         _lib_preflight(){ printf "PREFLIGHT\n" >> "$DSU_LOG"; return "$PF_RC"; }
         update_kiwix_library(){ :; }; is_safe_zim_name(){ return 1; }
+        if [ -n "${DSU_INSTALL:-}" ]; then
+            FILES_TO_UPDATE=("$WORK_DIR/a.zim|u|na|0" "$WORK_DIR/b.zim|u|nb|0")
+            is_safe_zim_name(){ return 0; }; get_remote_size(){ return 1; }
+            download_file(){ printf "DL\n" >> "$DSU_LOG"; return 0; }
+            # A -b child logs ERRORs only to the log file: collect them here.
+            LOGFILE_SAFE=true; LOG_FILE="$DSU_LOG"
+        fi
         stop_service_if_managed(){ printf "STOP\n" >> "$DSU_LOG"; return "$STOP_RC"; }
-        restore_service_if_managed(){ printf "RESTORE\n" >> "$DSU_LOG"; return 0; }
+        restore_service_if_managed(){ printf "RESTORE\n" >> "$DSU_LOG"; return "${RESTORE_RC:-0}"; }
         do_smart_update; printf "rc=%s\n" "$?" >> "$DSU_LOG"' 2>>"$LOG"
     cat "$LOG"
 }
@@ -692,8 +716,29 @@ out=$(dsu yes 1)
 # so this STOP-absent assertion genuinely proves the background skip.
 { ! printf '%s' "$out" | grep -q STOP && printf '%s' "$out" | grep -qx PREFLIGHT \
     && printf '%s' "$out" | grep -q '^rc='; } \
-  && pass "B3.25 do_smart_update -b child: skips service management (smart-update -b policy preserved)" \
+  && pass "B3.25 do_smart_update -b child with nothing installed: no service management" \
   || fail "B3.25 expected PREFLIGHT, rc=, and no STOP under background: '$out'"
+# BR1-BR4: a -b child keeps serving through the downloads, then restarts the
+# service ONCE at the end if anything was installed (else kiwix-serve keeps the
+# old library and the replaced files open).
+dsu_seq(){ printf '%s' "$1" | grep -E '^(DL|STOP|RESTORE)$' | tr '\n' ','; }
+out=$(DSU_INSTALL=1 dsu yes 0)
+{ [ "$(dsu_seq "$out")" = "DL,DL,STOP,RESTORE," ] && printf '%s' "$out" | grep -qx 'rc=0'; } \
+  && pass "BR1 -b child with installs: restarts once, after all downloads (rc 0)" \
+  || fail "BR1 seq='$(dsu_seq "$out")' out='$out'"
+out=$(DSU_INSTALL=1 dsu yes 1)
+{ printf '%s' "$out" | grep -q "$MSG_COULD_NOT_STOP_RELOAD" && printf '%s' "$out" | grep -qx 'rc=1' \
+    && [ "$(dsu_seq "$out")" = "DL,DL,STOP,RESTORE," ]; } \
+  && pass "BR2 -b child: stop for the restart fails -> ERROR, rc 1, restore still called" \
+  || fail "BR2 seq='$(dsu_seq "$out")' out='$out'"
+out=$(DSU_INSTALL=1 dsu no 0)
+[ "$(dsu_seq "$out")" = "STOP,DL,DL,RESTORE," ] \
+  && pass "BR3 foreground with installs: one stop before the downloads, no second stop" \
+  || fail "BR3 seq='$(dsu_seq "$out")' out='$out'"
+out=$(DSU_INSTALL=1 RESTORE_RC=1 dsu yes 0)
+printf '%s' "$out" | grep -qx 'rc=1' \
+  && pass "BR4 -b child: failed restart (server left down) fails the run" \
+  || fail "BR4 out='$out'"
 
 # --- positive control for the status/clean gate (guards the destructive rm path
 # against a vacuously-always-refusing gate) --------------------------------------

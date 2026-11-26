@@ -216,15 +216,15 @@ File matching includes special handling for:
 
 During updates, the script:
 1. Pre-flights the library (if present: a regular file, not a symlink, readable; its directory writable) and takes one backup per run of a non-empty library — before anything is stopped or downloaded
-2. Checks the Kiwix service and temporarily stops it if running (root mode only). `smart-update -b` leaves the service alone (it keeps serving during long downloads); `update-library`, including `update-library -b`, stops and restarts it. Unprivileged runs never touch it.
+2. Checks the Kiwix service and temporarily stops it if running (root mode only). `smart-update -b` instead keeps serving during the downloads; `update-library`, including `update-library -b`, stops and restarts it. Unprivileged runs never touch it.
 3. For each file: downloads, verifies, replaces, and immediately updates its library entry — so an interrupted run leaves every completed file consistent
-4. Restarts the service if it was running
+4. Restarts the service if it was running. `smart-update -b` stops and restarts it once at the end, and only if a file was updated, so kiwix-serve loads the new library and releases the replaced files. If the restart fails, the run exits non-zero.
 
 If a library operation fails (e.g. `kiwix-manage` rejects a ZIM), the update continues and the run exits non-zero; the error names the file. If the library itself can't be written, the run stops — even with `-c`, which only continues past per-file download failures — and you should run `update-library` after fixing the cause. Any failed file makes the run exit non-zero, with or without `-c`, so cron and systemd see the failure.
 
 Only one run at a time: `check-updates`, `smart-update`, `update-library` and `clean` take an exclusive lock (`.kiwix_run.lock` in the working directory, via `flock`) before touching any state, and a second run is refused with "Another kiwix-update run is in progress" instead of interfering. A `-b` run keeps the lock until the background process finishes. When upgrading from a version without the lock, let any running `-b` update finish (or stop it) first: the new `stop` recognises a run only by the lock it holds. `stop` takes no lock; it signals the background run together with its download, so nothing is left running.
 
-If a run is interrupted (SIGTERM, Ctrl-C, SIGHUP) after it stopped `kiwix-serve`, it restarts the service before exiting, and exits with 143/130/129 so cron and systemd see the failure. If the interruption came during a library update, the log says so ("Interrupted during a library update"); run `update-library` in that case.
+If a run is interrupted (SIGTERM, Ctrl-C, SIGHUP) after it stopped `kiwix-serve`, it restarts the service before exiting, and exits with 143/130/129 so cron and systemd see the failure. If the interruption came during a library update, the log says so ("Interrupted during a library update"); run `update-library` in that case. A `smart-update -b` run that is stopped after installing some files never reaches its end-of-run restart, so kiwix-serve keeps serving the old library: restart the service (e.g. `systemctl restart kiwix-serve`) to serve them.
 
 ### Exit codes
 

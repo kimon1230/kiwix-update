@@ -208,7 +208,8 @@ cmd_update_library() {
     update_kiwix_library || rc=$?
     # A refused reconcile (1) leaves the library inconsistent: keep the hint.
     [ "$rc" -eq 1 ] || LIB_BUSY=false
-    restore_service_if_managed
+    # A failed restart (server left down) fails an otherwise successful run.
+    restore_service_if_managed || [ "$rc" -ne 0 ] || rc=1
     return "$rc"
 }
 
@@ -699,7 +700,7 @@ cleanup() {
     # aborting the restart sequence (a child it hits directly can still die).
     if [ -f "${WORK_DIR}/.kiwix_was_running" ]; then
         trap ':' INT TERM HUP
-        restore_service_if_managed
+        restore_service_if_managed || true   # errexit: a failed start must not abort cleanup
     fi
 
     if [ -z "${KIWIX_BACKGROUND:-}" ] && ! ${QUIET}; then
@@ -1037,9 +1038,10 @@ require_service_stopped_if_unprivileged() {
 # returns, so a marker written after the stop would miss a signal that arrived
 # during it and leave kiwix-serve down. Starting an already-running service is
 # harmless; the marker is withdrawn only if a failed stop left it running.
-# This is the shared seam for the mode gate; the KIWIX_BACKGROUND
-# skip is a do_smart_update call-site policy (see there), NOT part of this helper,
-# so `update-library -b` still manages the service exactly as it did before.
+# This is the shared seam for the mode gate. When smart-update stops the service
+# is a do_smart_update call-site policy (see there: up front in the foreground, at
+# the end under -b), NOT part of this helper, so `update-library -b` still manages
+# the service exactly as it did before.
 stop_service_if_managed() {
     if ${UNPRIVILEGED}; then return 0; fi
     manage_kiwix_service status || return 0   # not running -> nothing to stop
@@ -1055,14 +1057,18 @@ stop_service_if_managed() {
 }
 
 # Restart kiwix-serve after a mutation iff we stopped it — ROOT MODE ONLY. The
-# single seam for the restore guard (mirror of stop_service_if_managed).
+# single seam for the restore guard (mirror of stop_service_if_managed). Returns
+# non-zero when the start failed (the server is left down), so callers can fail
+# the run; the marker is cleared either way.
 restore_service_if_managed() {
     if ${UNPRIVILEGED} || [ ! -f "${WORK_DIR}/.kiwix_was_running" ]; then
         return 0
     fi
     log "INFO" "Restarting Kiwix service..."
-    manage_kiwix_service start || log "ERROR" "Failed to restore Kiwix service"
+    local rc=0
+    manage_kiwix_service start || { rc=1; log "ERROR" "Failed to restore Kiwix service"; }
     rm -f "${WORK_DIR}/.kiwix_was_running"
+    return "$rc"
 }
 
 # True when the bulk .zim transfer must stay HTTPS-only: either the operator
@@ -2033,8 +2039,8 @@ do_smart_update() {
     fi
 
     # Stop Kiwix service if running (root mode only; see stop_service_if_managed).
-    # The background CHILD skips this: smart-update has always left the service
-    # alone under -b (unlike update-library, which manages it either way).
+    # The background CHILD skips this so kiwix-serve keeps serving through long
+    # downloads; it restarts the service once at the end instead (below).
     if [ -z "${KIWIX_BACKGROUND:-}" ] && ! stop_service_if_managed; then
         log "ERROR" "Cannot proceed without stopping Kiwix service"
         return 1
@@ -2155,9 +2161,22 @@ do_smart_update() {
         update_progress "$current" "$total" "$filename"
     done
 
-    # Restore Kiwix service (root mode only; see restore_service_if_managed).
-    restore_service_if_managed
-    
+    # A -b child left kiwix-serve running through the downloads, so it still has
+    # the old library and the replaced files open: restart it once if anything was
+    # installed. stop_service_if_managed writes the .kiwix_was_running marker first,
+    # so a signal between the stop and the start is still restored by cleanup(); the
+    # restore_service_if_managed below completes the restart.
+    if [ -n "${KIWIX_BACKGROUND:-}" ] && [ "$total_updated" -gt 0 ]; then
+        if ! stop_service_if_managed; then
+            log "ERROR" "Could not stop kiwix-serve to reload the library — it is still serving the old files; restart it manually"
+            update_success=false
+        fi
+    fi
+
+    # Restore Kiwix service (root mode only; see restore_service_if_managed). A
+    # failed start leaves the server down: fail the run so cron sees it.
+    restore_service_if_managed || update_success=false
+
     # Final status. Any failed file fails the run — also under -c, which only
     # decides whether to keep going, not what the run reports (cron must see it).
     if [ "$total_failed" -gt 0 ]; then
