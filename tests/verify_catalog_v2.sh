@@ -117,6 +117,7 @@ mk_feed(){ # $1=totalResults (or 'none'), $2=entry-emitter fn; -> $ROOT/feed.xml
 entry_full(){ cat <<'E'
 <entry>
 <name>a_2026-01</name>
+<articleCount>1347</articleCount>
 <author>
 <name>Auth</name>
 </author>
@@ -201,6 +202,7 @@ rec=$(head -n1 "$LIBRARY_CACHE")
 [ "$(cut -d'|' -f2 <<<"$rec")" = "a_2026-01.zim" ] && pass "C2 filename parsed" || fail "C2 filename wrong: $rec"
 [ "$(cut -d'|' -f3 <<<"$rec")" = "https://lb.download.kiwix.org/zim/a/a_2026-01.zim" ] && pass "C2 field-3 = absolute .zim URL" || fail "C2 field-3 wrong: $rec"
 [ "$(cut -d'|' -f4 <<<"$rec")" = "500" ] && pass "C2 size parsed" || fail "C2 size wrong: $rec"
+[ "$(cut -d'|' -f5 <<<"$rec")" = "1347" ] && pass "C2 articleCount parsed as field 5" || fail "C2 articleCount wrong: $rec"
 # multi-acquisition -> first wins
 entry_multi(){ cat <<'E'
 <entry>
@@ -215,7 +217,7 @@ E
 }
 mk_feed 1 entry_multi; rm -f "$LIBRARY_CACHE"; CATALOG="$ROOT/feed.xml" fetch_library_data >/dev/null 2>&1
 [ "$(head -n1 "$LIBRARY_CACHE" | cut -d'|' -f2)" = "first.zim" ] && pass "C2 first acquisition link wins" || fail "C2 multi-link: $(head -n1 "$LIBRARY_CACHE")"
-# no-publisher and no-length -> still 4 fields
+# no-publisher and no-length -> still 5 fields (the last, articleCount, empty)
 entry_nopub(){ cat <<'E'
 <entry>
 <name>np</name>
@@ -224,7 +226,7 @@ entry_nopub(){ cat <<'E'
 E
 }
 mk_feed 1 entry_nopub; rm -f "$LIBRARY_CACHE"; CATALOG="$ROOT/feed.xml" fetch_library_data >/dev/null 2>&1
-[ "$(head -n1 "$LIBRARY_CACHE" | awk -F'|' '{print NF}')" = 4 ] && pass "C2 no-publisher entry still 4 fields" || fail "C2 no-publisher field count: $(head -n1 "$LIBRARY_CACHE")"
+[ "$(head -n1 "$LIBRARY_CACHE" | awk -F'|' '{print NF}')" = 5 ] && pass "C2 no-publisher entry still 5 fields" || fail "C2 no-publisher field count: $(head -n1 "$LIBRARY_CACHE")"
 entry_nolen(){ cat <<'E'
 <entry>
 <name>nl</name>
@@ -236,7 +238,30 @@ entry_nolen(){ cat <<'E'
 E
 }
 mk_feed 1 entry_nolen; rm -f "$LIBRARY_CACHE"; CATALOG="$ROOT/feed.xml" fetch_library_data >/dev/null 2>&1
-[ "$(head -n1 "$LIBRARY_CACHE" | awk -F'|' '{print NF}')" = 4 ] && pass "C2 no-length entry still 4 fields" || fail "C2 no-length field count: $(head -n1 "$LIBRARY_CACHE")"
+[ "$(head -n1 "$LIBRARY_CACHE" | awk -F'|' '{print NF}')" = 5 ] && pass "C2 no-length entry still 5 fields" || fail "C2 no-length field count: $(head -n1 "$LIBRARY_CACHE")"
+# Per-entry reset: an entry without <articleCount> after one with it must not
+# inherit the count; a non-numeric count and a second tag are rejected/ignored.
+entry_counts(){ entry_full; cat <<'E'
+<entry>
+<name>b</name>
+<link rel="http://opds-spec.org/acquisition/open-access" href="https://lb.download.kiwix.org/zim/b/b_2026-01.zim.meta4" length="9"/>
+</entry>
+<entry>
+<name>c</name>
+<articleCount>12x</articleCount>
+<link rel="http://opds-spec.org/acquisition/open-access" href="https://lb.download.kiwix.org/zim/c/c_2026-01.zim.meta4" length="9"/>
+</entry>
+<entry>
+<name>d</name>
+<articleCount>40</articleCount>
+<articleCount>99</articleCount>
+<link rel="http://opds-spec.org/acquisition/open-access" href="https://lb.download.kiwix.org/zim/d/d_2026-01.zim.meta4" length="9"/>
+</entry>
+E
+}
+mk_feed 4 entry_counts; rm -f "$LIBRARY_CACHE"; CATALOG="$ROOT/feed.xml" fetch_library_data >/dev/null 2>&1
+got=$(cut -d'|' -f5 "$LIBRARY_CACHE" | tr '\n' ',')
+[ "$got" = "1347,,,40," ] && pass "C2 articleCount: reset per entry, digits only, first tag wins" || fail "C2 articleCount per-entry: '$got'"
 
 # ======================================================================
 echo; echo "########## C4 — host-pin accept/reject (via analyze_updates) ##########"
@@ -594,6 +619,48 @@ w=$(rn_warn "matched_2025-01.zim")
 [ -z "$w" ] && pass "RN7 no unmatched-file WARN when every local file matches" || fail "RN7 got '$w'"
 
 # ======================================================================
+echo; echo "########## Article counts — cache field 5 and library counts ##########"
+# find_latest_zim must carry field 5 (catalog articleCount) through every record
+# site; a legacy 4-field record (a cache written before the upgrade) gives "".
+fl_expect5(){ # $1=local  $2=expected field-2  $3=expected field-5  $4=label  $5..=records
+    local lf="$1" e2="$2" e5="$3" label="$4"; shift 4
+    printf '%s\n' "$@" > "$LIBRARY_CACHE"
+    local out; out=$(find_latest_zim "$lf")
+    { [ "$(cut -d'|' -f2 <<<"$out")" = "$e2" ] && [ "$(cut -d'|' -f5 <<<"$out")" = "$e5" ]; } \
+      && pass "$label" || fail "$label (got '$out')"
+}
+fl_expect5 "fl5x.zim" "fl5x.zim" "77" "FL5 exact undated match carries field 5" "pub|fl5x.zim|u|1|77"
+fl_expect5 "fl5d_2025-01.zim" "fl5d_2026-01.zim" "88" "FL5 dated match carries field 5" "pub|fl5d_2026-01.zim|u|1|88"
+fl_expect5 "www.ready.gov_en.zim" "ready.gov_en_all_2026-10.zim" "2503" "FL5 rename-table match carries field 5" "pub|ready.gov_en_all_2026-10.zim|u|1|2503"
+fl_expect5 "wiktionary_en_all_maxi_2025-06.zim" "wiktionary_en_all_nopic_2026-09.zim" "55" "FL5 nopic fallback carries field 5" "pub|wiktionary_en_all_nopic_2026-09.zim|u|1|55"
+fl_expect5 "fl5l_2025-01.zim" "fl5l_2026-01.zim" "" "FL5 legacy 4-field record -> empty field 5" "pub|fl5l_2026-01.zim|u|1"
+
+# _lib_load's optional third array: articleCount per book, aligned with ids and
+# paths, "" for a book without the attribute; the two-argument form unchanged.
+LA_SAVED_LIB="$ZIM_LIBRARY"; ZIM_LIBRARY="$ROOT/la/library.xml"; mkdir -p "$ROOT/la"
+cat > "$ZIM_LIBRARY" <<E
+<library version="20110515">
+  <book id="i1" path="one.zim" title="t" articleCount="11" mediaCount="1" size="1" />
+  <book id="i2" path="two.zim" title="t" mediaCount="1" size="1" />
+  <book id="i3" path="$ROOT/la/three.zim" title="t" articleCount="33" size="1" />
+</library>
+E
+la_ids=(); la_paths=(); la_counts=()
+_lib_load la_ids la_paths la_counts; la_rc=$?
+{ [ "$la_rc" -eq 0 ] && [ "${#la_counts[@]}" -eq 3 ] && [ "${la_counts[0]}" = 11 ] && [ -z "${la_counts[1]}" ] \
+    && [ "${la_counts[2]}" = 33 ] && [ "${la_paths[0]}" = "$ROOT/la/one.zim" ] && [ "${la_paths[2]}" = "$ROOT/la/three.zim" ]; } \
+  && pass "LA _lib_load: counts aligned with paths, '' for a book without articleCount" \
+  || fail "LA rc=$la_rc counts=(${la_counts[*]}) paths=(${la_paths[*]})"
+la_ids=(); la_paths=(); _lib_load la_ids la_paths; la_rc=$?
+{ [ "$la_rc" -eq 0 ] && [ "${#la_paths[@]}" -eq 3 ]; } && pass "LA _lib_load: two-argument form unchanged" || fail "LA 2-arg rc=$la_rc n=${#la_paths[@]}"
+# A resolve-count mismatch (rc 2) must not leave stale counts behind.
+la_counts=(stale stale stale)
+la_rc=$( _lib_resolve_paths(){ printf '%s\0' "/only/one"; }
+         _lib_load la_ids la_paths la_counts; echo "$?:${#la_counts[@]}" )
+[ "$la_rc" = "2:0" ] && pass "LA _lib_load: rc 2 on a resolve mismatch clears the counts" || fail "LA rc2 got '$la_rc'"
+ZIM_LIBRARY="$LA_SAVED_LIB"
+
+# ======================================================================
 echo; echo "########## M1 — transient (rc2) stops retrying vs definitive (rc1) re-downloads ##########"
 # verify_downloaded_file returns 2 for a TRANSIENT metalink fetch error and 1 for
 # a DEFINITIVE integrity failure. download_file's retry loop must diverge on them:
@@ -923,14 +990,23 @@ echo; echo "########## M8 — analyze_updates decision arms (size / newer) #####
 # veto is actually reachable. UPDATE_CRITERIA restored to all at the end (leak is
 # bidirectional).
 BACKGROUND=false
-m8_run(){ # $1=local .zim  $2=catalog field-2 dated .zim  $3=field-4  $4=criteria  [$5=local bytes, default 100]  [$6=local mtime for touch -d] -> M8_HIT
-    rm -f "$WORK_DIR"/*.zim 2>/dev/null
+m8_run(){ # $1=local .zim  $2=catalog field-2 dated .zim  $3=field-4  $4=criteria  [$5=local bytes, default 100]  [$6=local mtime for touch -d]  [$7=local articleCount -> library.xml]  [$8=cache field-5, appended only when given] -> M8_HIT (+ M8_OUT when M8_STDOUT=1)
+    rm -f "$WORK_DIR"/*.zim "$ZIM_LIBRARY" 2>/dev/null
     head -c "${5:-100}" /dev/zero > "$WORK_DIR/$1"
     # After the write (which sets mtime to now): an undated local is dated by mtime.
     [ -n "${6:-}" ] && touch -d "$6" "$WORK_DIR/$1"
-    printf 'pub|%s|https://lb.download.kiwix.org/zim/x/%s|%s\n' "$2" "$2" "$3" > "$LIBRARY_CACHE"
-    FILES_TO_UPDATE=()
-    UPDATE_CRITERIA="$4" analyze_updates >/dev/null 2>&1
+    # The library lives in WORK_DIR, so the book path is relative to it.
+    [ -n "${7:-}" ] && printf '<library version="20110515">\n  <book id="m8" path="%s" articleCount="%s" mediaCount="1" size="1" />\n</library>\n' "$1" "$7" > "$ZIM_LIBRARY"
+    local f5=""; [ $# -ge 8 ] && f5="|$8"
+    printf 'pub|%s|https://lb.download.kiwix.org/zim/x/%s|%s%s\n' "$2" "$2" "$3" "$f5" > "$LIBRARY_CACHE"
+    FILES_TO_UPDATE=(); M8_OUT=""
+    if [ -n "${M8_STDOUT:-}" ]; then
+        # In this shell (not $(...)), or FILES_TO_UPDATE would be lost.
+        KIWIX_BACKGROUND="" QUIET=false UPDATE_CRITERIA="$4" analyze_updates > "$ROOT/m8.out" 2>&1
+        M8_OUT=$(<"$ROOT/m8.out")
+    else
+        UPDATE_CRITERIA="$4" analyze_updates >/dev/null 2>&1
+    fi
     M8_HIT=no; printf '%s\n' "${FILES_TO_UPDATE[@]}" | grep -qF "$2" && M8_HIT=yes
 }
 
@@ -986,6 +1062,50 @@ for crit in newer all; do
     m8_run "vs11.zim" "vs11_2026-11a.zim" 100 "$crit" 100 2020-01-01
     [ "$M8_HIT" = yes ] && pass "VS11 $crit: undated old local vs suffixed remote flagged (timestamp path)" || fail "VS11 $crit: suffixed remote timestamp not derived"
 done
+
+# --- article-count guard. Local file 100 B (KiB-ceil 1024): field-4 40 = "40%",
+# 95 = "95%", 2048 = "bigger". Every remote is newer by name (or by mtime for an
+# undated local), EXCEPT AG11b, which reaches the decision through "bigger" only.
+m8_run ag1_2026-01.zim ag1_2026-02.zim 40 all "" "" 100 105
+[ "$M8_HIT" = yes ] && pass "AG1 all: more articles, 40% bytes -> updated (no byte veto)" || fail "AG1 all: not flagged"
+M8_STDOUT=1 m8_run ag2_2026-01.zim ag2_2026-02.zim 40 newer "" "" 100 105
+{ [ "$M8_HIT" = yes ] && grep -q 'Newer version:' <<<"$M8_OUT"; } \
+  && pass "AG2 newer: more articles, 40% bytes -> updated (no 50% veto)" || fail "AG2 newer: hit=$M8_HIT out='$M8_OUT'"
+M8_STDOUT=1 m8_run ag3_2026-01.zim ag3_2026-02.zim 2048 all "" "" 100 70
+{ [ "$M8_HIT" = no ] && [ -n "$M8_OUT" ] && grep -q 'Held back' <<<"$M8_OUT" \
+    && grep -q 'Fewer articles than local (100 → 70)' <<<"$M8_OUT" && ! grep -q 'size +' <<<"$M8_OUT"; } \
+  && pass "AG3 all: bigger and newer but fewer articles -> Held back" || fail "AG3 all: hit=$M8_HIT out='$M8_OUT'"
+M8_STDOUT=1 m8_run ag4_2026-01.zim ag4_2026-02.zim 95 newer "" "" 100 70
+{ [ "$M8_HIT" = no ] && [ -n "$M8_OUT" ] && grep -q 'Held back' <<<"$M8_OUT" \
+    && grep -q 'Fewer articles than local (100 → 70)' <<<"$M8_OUT"; } \
+  && pass "AG4 newer: fewer articles -> Held back" || fail "AG4 newer: hit=$M8_HIT out='$M8_OUT'"
+m8_run ag5_2026-01.zim ag5_2026-02.zim 40 all "" "" 100 90
+[ "$M8_HIT" = yes ] && pass "AG5 all: exactly 90% of the articles -> updated (threshold inclusive)" || fail "AG5 all: 90% not flagged"
+m8_run ag5b_2026-01.zim ag5b_2026-02.zim 40 all "" "" 100 89
+[ "$M8_HIT" = no ] && pass "AG5b all: 89% of the articles -> held back" || fail "AG5b all: 89% flagged"
+m8_run ag7_2026-01.zim ag7_2026-02.zim 40 all "" "" 100
+[ "$M8_HIT" = no ] && pass "AG7 all: legacy 4-field cache (no catalog count) -> byte veto as before" || fail "AG7 all: flagged without a catalog count"
+m8_run www.ready.gov_en.zim ready.gov_en_all_2026-10.zim 40 all "" 2020-01-01 100 105
+[ "$M8_HIT" = yes ] && pass "AG9 all: renamed title (undated local), more articles, 40% bytes -> updated" || fail "AG9 all: rename case not flagged"
+m8_run ag10_2026-01.zim ag10_2026-02.zim 95 all "" "" 100 0
+[ "$M8_HIT" = yes ] && pass "AG10 all: catalog count 0 = unknown -> byte check (95%) passes" || fail "AG10 all: count 0 treated as known"
+m8_run wiktionary_en_all_maxi_2025-01.zim wiktionary_en_all_nopic_2025-02.zim 30 all "" "" 100 100
+[ "$M8_HIT" = no ] && pass "AG11 all: maxi -> nopic fallback keeps the byte veto" || fail "AG11 all: nopic downgrade flagged"
+M8_STDOUT=1 m8_run wiktionary_en_all_maxi_2025-01.zim wiktionary_en_all_nopic.zim 2048 all "" "" 100 50
+{ [ "$M8_HIT" = yes ] && grep -q 'size +' <<<"$M8_OUT"; } \
+  && pass "AG11b all: undated nopic fallback -> counts ignored, legacy size path" || fail "AG11b all: hit=$M8_HIT out='$M8_OUT'"
+
+# AG12: the summary WARN names every held-back book, by local name, with counts.
+rm -f "$WORK_DIR"/*.zim 2>/dev/null; : > "$LOG_FILE"
+mkzim "$WORK_DIR/ag12a_2026-01.zim"; mkzim "$WORK_DIR/ag12b_2026-01.zim"
+printf '<library version="20110515">\n  <book id="a" path="ag12a_2026-01.zim" articleCount="100" />\n  <book id="b" path="ag12b_2026-01.zim" articleCount="100" />\n</library>\n' > "$ZIM_LIBRARY"
+printf 'pub|ag12a_2026-02.zim|https://lb.download.kiwix.org/zim/x/ag12a_2026-02.zim|40|50\npub|ag12b_2026-02.zim|https://lb.download.kiwix.org/zim/x/ag12b_2026-02.zim|40|50\n' > "$LIBRARY_CACHE"
+FILES_TO_UPDATE=()
+LOGFILE_SAFE=true UPDATE_CRITERIA=all analyze_updates >/dev/null 2>&1
+w=$(grep 'book(s) held back' "$LOG_FILE")
+{ grep -q '2 book(s) held back' <<<"$w" && grep -qF 'ag12a_2026-01.zim (100 → 50), ag12b_2026-01.zim (100 → 50)' <<<"$w"; } \
+  && pass "AG12 summary WARN lists every held-back book with its counts" || fail "AG12 got '$w'"
+FILES_TO_UPDATE=(); rm -f "$ZIM_LIBRARY"
 UPDATE_CRITERIA=all   # restore the harness global (leak is bidirectional)
 
 # ======================================================================

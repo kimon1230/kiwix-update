@@ -24,6 +24,9 @@ KIWIX_LIBRARY_API="https://opds.library.kiwix.org/catalog/v2/entries?count=-1"
 # same-month rebuild (_2026-09b). Compares correctly as a string. Use UNQUOTED on
 # the right of =~ (quoted, it would match literally).
 ZIM_VER_RE='[0-9]{4}-[0-9]{2}[[:lower:]]?'
+# A newer catalog build must keep at least this % of the local article count
+# (when both are known) to replace it under the 'newer'/'all' criteria.
+readonly ARTICLE_MIN_PCT=90
 
 # Default values
 YES_TO_ALL=false
@@ -170,28 +173,32 @@ _lib_resolve_paths() {
     realpath -ms -z -- "${_rp_abs[@]}"
 }
 
-# ARR_IDS ARR_PATHS -> parallel arrays of book ids and resolved absolute paths.
+# ARR_IDS ARR_PATHS [ARR_COUNTS] -> parallel arrays of book ids, resolved absolute
+# paths and (optionally) articleCount ("" when absent or not a number).
 # rc 0 = ok (empty when the library file is absent); rc 2 = could not read/resolve.
-# Namerefs and locals are _ll_-prefixed so no caller name can collide with them.
+# Namerefs and locals (all three arrays included) are _ll_-prefixed so no caller
+# name can collide with them.
 _lib_load() {
-    local -n _ll_ids=$1 _ll_paths=$2
-    _ll_ids=(); _ll_paths=()
+    local -a _ll_nocounts=()
+    local -n _ll_ids=$1 _ll_paths=$2 _ll_counts=${3:-_ll_nocounts}
+    _ll_ids=(); _ll_paths=(); _ll_counts=()
     [ -f "$ZIM_LIBRARY" ] || return 0
-    local _ll_dir="" _ll_line _ll_id _ll_path
+    local _ll_dir="" _ll_line _ll_id _ll_path _ll_count
     local -a _ll_raw=() _ll_resolved=()
     _ll_dir=$(realpath -ms -- "$(dirname -- "$ZIM_LIBRARY")") && [ -n "$_ll_dir" ] || return 2
     while IFS= read -r _ll_line || [ -n "$_ll_line" ]; do
         [[ "$_ll_line" =~ \<book ]] || continue
-        _ll_id=""; _ll_path=""
+        _ll_id=""; _ll_path=""; _ll_count=""
         [[ "$_ll_line" =~ [[:space:]]id=\"([^\"]+)\" ]]   && _ll_id="${BASH_REMATCH[1]}"
         [[ "$_ll_line" =~ [[:space:]]path=\"([^\"]+)\" ]] && _ll_path="${BASH_REMATCH[1]}"
+        [[ "$_ll_line" =~ [[:space:]]articleCount=\"([0-9]{1,15})\" ]] && _ll_count="${BASH_REMATCH[1]}"
         if [ -n "$_ll_id" ] && [ -n "$_ll_path" ]; then
-            _ll_ids+=("$_ll_id"); _ll_raw+=("$_ll_path")
+            _ll_ids+=("$_ll_id"); _ll_raw+=("$_ll_path"); _ll_counts+=("$_ll_count")
         fi
     done < "$ZIM_LIBRARY" || return 2   # unreadable library = error, never "empty"
     mapfile -d '' _ll_resolved < <(_lib_resolve_paths "$_ll_dir" "${_ll_raw[@]}")
     if [ "${#_ll_resolved[@]}" -ne "${#_ll_raw[@]}" ]; then
-        _ll_ids=(); _ll_paths=(); return 2
+        _ll_ids=(); _ll_paths=(); _ll_counts=(); return 2
     fi
     _ll_paths=("${_ll_resolved[@]}")
     return 0
@@ -461,7 +468,7 @@ fetch_library_data() {
         # Parse the ATOM feed
         awk '
             length($0) > 100000 { next }   # skip absurdly long lines (DoS guard)
-            /<entry>/ { in_entry=1; publisher=""; link=""; size=""; }
+            /<entry>/ { in_entry=1; publisher=""; link=""; size=""; articles=""; articles_seen=0; }
             /<\/entry>/ { 
                 if (link != "") {
                     # The v2 acquisition href is already the absolute
@@ -479,7 +486,9 @@ fetch_library_data() {
                     gsub(/[|[:cntrl:][:space:]]/, "", filename);
                     gsub(/[|[:cntrl:][:space:]]/, "", path);
                     gsub(/[|[:cntrl:][:space:]]/, "", size);
-                    print publisher "|" filename "|" path "|" size
+                    # Article count: digits only, else empty (= unknown).
+                    if (articles !~ /^[0-9]+$/) articles = "";
+                    print publisher "|" filename "|" path "|" size "|" articles
                 }
                 in_entry=0; 
             }
@@ -490,6 +499,13 @@ fetch_library_data() {
                     gsub(/<\/name>.*/, "", $0);
                     publisher=$0;
                 }
+            }
+            in_entry && !articles_seen && /<articleCount>/ {
+                # First <articleCount> per entry only.
+                articles_seen=1;
+                articles=$0;
+                gsub(/.*<articleCount>/, "", articles);
+                gsub(/<\/articleCount>.*/, "", articles);
             }
             in_entry && link=="" && /rel="http:\/\/opds-spec.org\/acquisition\/open-access"/ {
                 # First open-access acquisition link wins (deterministic if a
@@ -629,12 +645,12 @@ find_latest_zim() {
     local best_match=""
     local best_date=""
     
-    while IFS='|' read -r publisher filename path size; do
+    while IFS='|' read -r publisher filename path size articles; do
         local file_base="${filename%.zim}"
         
         # Exact match
         if [ "$file_base" = "$base_name" ]; then
-            result="${publisher}|${filename}|${path}|${size}"
+            result="${publisher}|${filename}|${path}|${size}|${articles}"
             break
         fi
         
@@ -644,10 +660,10 @@ find_latest_zim() {
                 local date_part="${file_base##*_}"
                 if [ -z "$best_date" ] || [[ "$date_part" > "$best_date" ]]; then
                     best_date="$date_part"
-                    best_match="${publisher}|${filename}|${path}|${size}"
+                    best_match="${publisher}|${filename}|${path}|${size}|${articles}"
                 fi
             else
-                result="${publisher}|${filename}|${path}|${size}"
+                result="${publisher}|${filename}|${path}|${size}|${articles}"
                 break
             fi
         fi
@@ -657,7 +673,7 @@ find_latest_zim() {
             local date_part="${file_base##*_}"
             if [ -z "$best_date" ] || [[ "$date_part" > "$best_date" ]]; then
                 best_date="$date_part"
-                best_match="${publisher}|${filename}|${path}|${size}"
+                best_match="${publisher}|${filename}|${path}|${size}|${articles}"
             fi
         fi
     done < "$LIBRARY_CACHE"
@@ -672,10 +688,10 @@ find_latest_zim() {
         if [[ "$base_name" =~ ^wiktionary_.*_all(_maxi)?$ ]]; then
             local nopic_name="${base_name%_maxi}_nopic"
             local nopic_re="${nopic_name//./\\.}"
-            while IFS='|' read -r publisher filename path size; do
+            while IFS='|' read -r publisher filename path size articles; do
                 local file_base="${filename%.zim}"
                 if [[ "$file_base" =~ ^${nopic_re}(_${ZIM_VER_RE})?$ ]]; then
-                    result="${publisher}|${filename}|${path}|${size}"
+                    result="${publisher}|${filename}|${path}|${size}|${articles}"
                     break
                 fi
             done < "$LIBRARY_CACHE"
@@ -1745,6 +1761,27 @@ analyze_updates() {
         return 1
     fi
 
+    # Local article counts from the library (kiwix-manage records each book's
+    # articleCount), keyed by resolved path. The completeness check compares them
+    # with the catalog's count; any gap here just means "unknown" for that file,
+    # which falls back to the byte-size check. Keys use the same lexical
+    # resolution as _lib_load (one realpath for WORK_DIR, none per file).
+    local -A lib_articles=()
+    local held_back=()             # newer/bigger catalog builds refused for fewer articles
+    local art_known_count=0
+    local -a _lb_ids=() _lb_paths=() _lb_counts=()
+    local wd_abs="" _lb_rc=0 _lb_i
+    _lib_load _lb_ids _lb_paths _lb_counts || _lb_rc=$?
+    if [ "$_lb_rc" -eq 0 ] && wd_abs=$(realpath -ms -- "${WORK_DIR}") && [ -n "$wd_abs" ]; then
+        wd_abs="${wd_abs%/}"
+        for _lb_i in "${!_lb_paths[@]}"; do
+            [ -n "${_lb_counts[$_lb_i]}" ] && lib_articles["${_lb_paths[$_lb_i]}"]="${_lb_counts[$_lb_i]}"
+        done
+    else
+        wd_abs=""
+        ${DEBUG} && log "DEBUG" "Library article counts unavailable (rc ${_lb_rc}) — using the byte-size check"
+    fi
+
     # Process each file
     for f in "${zim_files[@]}"; do
         local filename=$(basename "$f")
@@ -1770,10 +1807,8 @@ analyze_updates() {
         fi
         
         # Parse the result
-        local latest_filename latest_path remote_size
-        latest_filename=$(echo "$latest_info" | cut -d'|' -f2)
-        latest_path=$(echo "$latest_info" | cut -d'|' -f3)
-        remote_size=$(echo "$latest_info" | cut -d'|' -f4)
+        local latest_filename latest_path remote_size remote_articles _pub
+        IFS='|' read -r _pub latest_filename latest_path remote_size remote_articles <<< "$latest_info"
 
         # The catalog 'length' attribute is optional. When it is missing, the
         # 'size' criterion reports "Unknown" (it has no other signal); 'newer'
@@ -1830,6 +1865,28 @@ analyze_updates() {
         fi
         kept_parts+=("${latest_name}.zim.part")   # the catalog offers this file: its partial can resume
 
+        # Completeness by article count. Known only when both counts are positive
+        # numbers (0 = not computed) and the match is not the wiktionary maxi ->
+        # nopic flavour fallback, which stays behind the byte-size check so a
+        # text-only build never replaces the illustrated one. When known, a newer
+        # or bigger build with fewer than ARTICLE_MIN_PCT% of the local articles
+        # is held back, and no byte-ratio veto applies (bytes track compression
+        # and media format, not completeness).
+        local local_articles="" art_known=false fewer_articles=false
+        [ -n "$wd_abs" ] && local_articles="${lib_articles["$wd_abs/$filename"]-}"
+        if [[ "$local_articles" =~ ^[0-9]{1,15}$ ]] && [[ "$remote_articles" =~ ^[0-9]{1,15}$ ]]; then
+            local_articles=$(( 10#$local_articles )); remote_articles=$(( 10#$remote_articles ))
+            if [ "$local_articles" -gt 0 ] && [ "$remote_articles" -gt 0 ] \
+               && ! { [[ "$latest_name" =~ _nopic(_${ZIM_VER_RE})?$ ]] \
+                      && ! [[ "${filename%.zim}" =~ _nopic(_${ZIM_VER_RE})?$ ]]; }; then
+                art_known=true
+                art_known_count=$((art_known_count + 1))
+                if [ $(( remote_articles * 100 )) -lt $(( local_articles * ARTICLE_MIN_PCT )) ]; then
+                    fewer_articles=true
+                fi
+            fi
+        fi
+
         local status="Up to date"
         local details=""
         local update_needed=false
@@ -1882,7 +1939,18 @@ analyze_updates() {
                     is_newer=true
                 fi
                 
-                if $is_newer; then
+                if $is_newer && $art_known; then
+                    # Article counts decide; bytes don't (see art_known above).
+                    if $fewer_articles; then
+                        status="Held back"
+                        details="Fewer articles than local (${local_articles} → ${remote_articles})"
+                        held_back+=("$(_disp "$filename") (${local_articles} → ${remote_articles})")
+                    else
+                        status="Update needed"
+                        details="Newer version: $latest_name"
+                        update_needed=true
+                    fi
+                elif $is_newer; then
                     # Check if suspiciously smaller (only when the remote size is known)
                     local size_ratio=100
                     if $size_known && [ "$local_size" -gt 0 ]; then
@@ -1940,7 +2008,9 @@ analyze_updates() {
 
                 if $is_newer; then
                     reasons+=("newer: $latest_name")
-                    if [ ${#reasons[@]} -eq 1 ]; then  # Only newer, not bigger
+                    if $art_known; then
+                        should_update=true   # article counts decide below, not bytes
+                    elif [ ${#reasons[@]} -eq 1 ]; then  # Only newer, not bigger
                         local size_ratio=100
                         if $size_known && [ "$local_size" -gt 0 ]; then
                             size_ratio=$(( (remote_size * 100) / local_size ))
@@ -1954,7 +2024,12 @@ analyze_updates() {
                     fi
                 fi
 
-                if $should_update; then
+                if $should_update && $fewer_articles; then
+                    # A newer or bigger build that is less complete: never taken.
+                    status="Held back"
+                    details="Fewer articles than local (${local_articles} → ${remote_articles})"
+                    held_back+=("$(_disp "$filename") (${local_articles} → ${remote_articles})")
+                elif $should_update; then
                     status="Update needed"
                     details=$(IFS=","; echo "${reasons[*]}")
                     update_needed=true
@@ -2008,6 +2083,14 @@ analyze_updates() {
         printf -v unmatched_list '%s, ' "${unmatched[@]}"
         log "WARN" "${#unmatched[@]} local ZIM(s) match nothing in the Kiwix catalog (renamed or withdrawn upstream): ${unmatched_list%, }"
     fi
+    # Held back stays held back until a build with enough articles appears, so
+    # say so every run rather than reporting these as merely "up to date".
+    if [ ${#held_back[@]} -gt 0 ]; then
+        local held_list
+        printf -v held_list '%s, ' "${held_back[@]}"
+        log "WARN" "${#held_back[@]} book(s) held back: the catalog build has fewer articles: ${held_list%, }"
+    fi
+    ${DEBUG} && log "DEBUG" "Article counts known for ${art_known_count} of ${#zim_files[@]} local file(s)"
     log "INFO" "Total download size needed: $(numfmt --to=iec-i --suffix=B "${total_download_size}")"
     [ $unknown_sizes -gt 0 ] && log "INFO" "Note: ${unknown_sizes} file(s) had no catalog size — total is a lower bound; per-file space is re-checked at download time"
     

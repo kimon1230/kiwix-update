@@ -187,6 +187,8 @@ The script supports three update determination methods:
 - **newer**: Update when remote file has more recent timestamp
 - **all**: Update when either size or date criteria indicate newer content (default)
 
+For `newer` and `all`, a newer build is also checked for completeness. When the article count is known for both the local book (from `library_zim.xml`) and the catalog build, the newer build is taken unless it has fewer than 90% of the local articles. A rebuild that is smaller on disk but has as many articles (better compression, newer image formats) is therefore updated. A build with fewer articles is shown as **Held back**, and the run ends with a warning listing such books. For example, current Wikisource builds leave out the page-by-page scan transcriptions. Replacing a held-back book is your call. When either count is unknown, a newer build that is much smaller on disk is held back instead (below 90% of the local size for `all`, below 50% for `newer`). The same size rule always applies when a picture (`maxi`) edition only matches a text-only (`nopic`) build in the catalog.
+
 ### Practical Examples
 
 ```bash
