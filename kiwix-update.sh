@@ -585,7 +585,10 @@ find_latest_zim() {
     
     ${DEBUG} && log "DEBUG" "Looking for matches for: $base_name"
     
-    # Handle special cases for renamed files
+    # Titles Kiwix renamed upstream (the catalog carries no "replaces" link, so
+    # these are listed by hand; analyze_updates WARNs about local files that
+    # match nothing, which is how a new rename shows up). Only same-content
+    # renames belong here: the old file is deleted once the new one installs.
     case "$base_name" in
         wiktionary_*_all_maxi)
             alt_name="${base_name%_maxi}"
@@ -599,14 +602,25 @@ find_latest_zim() {
         wikihow_en_maxi)
             alt_name="wikihow_en_all"
             ;;
+        cogsci.stackexchange.com_en_all)      # site renamed Psychology & Neuroscience
+            alt_name="psychology.stackexchange.com_en_all"
+            ;;
+        health.stackexchange.com_en_all)      # site renamed Medical Sciences
+            alt_name="medicalsciences.stackexchange.com_en_all"
+            ;;
+        fas-military-medicine_en)
+            alt_name="irp.fas.org_en_military-medicine"
+            ;;
+        www.ready.gov_en)
+            alt_name="ready.gov_en_all"
+            ;;
     esac
-    
+
     # Dot-safe stems: a literal '.' in a title (e.g. nhs.uk, superuser.com) must
     # match '.', not any char, when interpolated into the =~ patterns below. '.' is
     # the only ERE metacharacter that occurs in Kiwix names ([A-Za-z0-9._-]), so a
-    # dot-only escape is complete for this domain. alt_re/nopic_re come from the
-    # hardcoded rename table and never contain a dot — their escape is uniform for
-    # safety but currently unreachable.
+    # dot-only escape is complete for this domain. It applies to rename-table
+    # targets too (several contain dots).
     local base_re="${base_name//./\\.}"
     local alt_re="${alt_name//./\\.}"
 
@@ -1704,6 +1718,7 @@ analyze_updates() {
     local total_partial_credit=0   # bytes already on disk in resumable partials
     local kept_parts=()            # partials _drop_dead_partials must keep (offered names, skipped stems)
     local skipped_files=0
+    local unmatched=()             # local ZIMs the catalog no longer lists (renamed or withdrawn)
     local unknown_sizes=0
     
     # Show table header
@@ -1749,6 +1764,7 @@ analyze_updates() {
                 "SKIPPED" \
                 "No match in library"
             skipped_files=$((skipped_files + 1))
+            unmatched+=("$(_disp "$filename")")
             kept_parts+=("$(_zim_stem "$filename")")
             continue
         fi
@@ -1985,6 +2001,13 @@ analyze_updates() {
     
     log "INFO" "Updates needed: ${total_updates}"
     [ $skipped_files -gt 0 ] && log "INFO" "Files skipped: ${skipped_files}"
+    # They never update again. A rename needs a find_latest_zim rename-table
+    # entry; a withdrawn title stays at its last version.
+    if [ ${#unmatched[@]} -gt 0 ]; then
+        local unmatched_list
+        printf -v unmatched_list '%s, ' "${unmatched[@]}"
+        log "WARN" "${#unmatched[@]} local ZIM(s) match nothing in the Kiwix catalog (renamed or withdrawn upstream): ${unmatched_list%, }"
+    fi
     log "INFO" "Total download size needed: $(numfmt --to=iec-i --suffix=B "${total_download_size}")"
     [ $unknown_sizes -gt 0 ] && log "INFO" "Note: ${unknown_sizes} file(s) had no catalog size — total is a lower bound; per-file space is re-checked at download time"
     

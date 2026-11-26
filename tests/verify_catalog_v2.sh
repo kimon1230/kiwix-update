@@ -555,6 +555,45 @@ i1_e2e "nhs.uk_en_medicines_2025-03.zim" "nhs.uk_en_medicines_2026-09b.zim" \
   "VS7 suffixed catalog entry drives an update end-to-end (the Pi case)"
 
 # ======================================================================
+echo; echo "########## Upstream renames + unmatched-file WARN ##########"
+# Rename-table entries map a local stem to its renamed catalog title. Undated and
+# dated local forms both occur on real installs. The dotted targets need their
+# dots matched literally: each case carries a newer wildcard decoy.
+fl_expect "cogsci.stackexchange.com_en_all.zim" "psychology.stackexchange.com_en_all_2026-10.zim" \
+  "RN1 cogsci SE (undated local) -> psychology SE" \
+  "pub|psychologyXstackexchange.com_en_all_2026-12.zim|u|1" \
+  "pub|psychology.stackexchange.com_en_all_2026-10.zim|u|1"
+fl_expect "health.stackexchange.com_en_all_2024-03.zim" "medicalsciences.stackexchange.com_en_all_2026-10.zim" \
+  "RN2 health SE (dated local) -> medicalsciences SE" \
+  "pub|medicalsciences.stackexchange.com_en_all_2026-10.zim|u|1"
+fl_expect "fas-military-medicine_en_2024-12.zim" "irp.fas.org_en_military-medicine_2026-10.zim" \
+  "RN3 fas-military-medicine -> irp.fas.org_en_military-medicine" \
+  "pub|irpXfas.org_en_military-medicine_2026-12.zim|u|1" \
+  "pub|irp.fas.org_en_military-medicine_2026-10.zim|u|1"
+fl_expect "www.ready.gov_en.zim" "ready.gov_en_all_2026-10.zim" \
+  "RN4 www.ready.gov_en -> ready.gov_en_all" \
+  "pub|ready.gov_en_all_2026-10.zim|u|1"
+i1_e2e "fas-military-medicine_en_2024-12.zim" "irp.fas.org_en_military-medicine_2026-10.zim" \
+  "RN5 a renamed title drives an update end-to-end"
+
+# The run summary names every local file that matches nothing (a new upstream
+# rename or a withdrawn title), instead of a DEBUG line per file.
+rn_warn(){ # $1..=on-disk names; catalog offers only matched_2026-10 -> prints the WARN line(s)
+    rm -f "$WORK_DIR"/*.zim 2>/dev/null; : > "$LOG_FILE"
+    local n; for n in "$@"; do mkzim "$WORK_DIR/$n"; done
+    printf 'pub|matched_2026-10.zim|https://lb.download.kiwix.org/zim/x/matched_2026-10.zim|100\n' > "$LIBRARY_CACHE"
+    FILES_TO_UPDATE=()
+    LOGFILE_SAFE=true analyze_updates >/dev/null 2>&1
+    grep 'match nothing in the Kiwix catalog' "$LOG_FILE"
+}
+w=$(rn_warn "gone_a_2024-01.zim" "matched_2025-01.zim" "gone_b.zim")
+{ grep -q '2 local ZIM(s) match nothing' <<<"$w" && grep -q 'gone_a_2024-01.zim, gone_b.zim' <<<"$w" \
+    && ! grep -q 'matched_' <<<"$w"; } \
+  && pass "RN6 summary WARN lists exactly the unmatched local files" || fail "RN6 got '$w'"
+w=$(rn_warn "matched_2025-01.zim")
+[ -z "$w" ] && pass "RN7 no unmatched-file WARN when every local file matches" || fail "RN7 got '$w'"
+
+# ======================================================================
 echo; echo "########## M1 — transient (rc2) stops retrying vs definitive (rc1) re-downloads ##########"
 # verify_downloaded_file returns 2 for a TRANSIENT metalink fetch error and 1 for
 # a DEFINITIVE integrity failure. download_file's retry loop must diverge on them:
