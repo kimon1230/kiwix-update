@@ -517,6 +517,44 @@ fl_expect "foo_en_all_2025-08-15.zim" "foo_en_all_2025-08-15.zim" \
   "pub|foo_en_all_2025-08-15.zim|u|1"
 
 # ======================================================================
+echo; echo "########## Version suffix — same-month rebuilds (_YYYY-MMx) ##########"
+# Kiwix names a same-month rebuild <stem>_YYYY-MM<letter> (e.g. _2026-09b); the
+# live catalog carries ~120 such entries, always one lowercase letter. Pre-fix
+# every version regex accepted only _YYYY-MM, so such books were skipped forever.
+fl_expect "nhs.uk_en_medicines_2025-03.zim" "nhs.uk_en_medicines_2026-09b.zim" \
+  "VS1 dated local resolves to a suffixed catalog entry; newer dotted decoy rejected" \
+  "pub|nhs.uk_en_medicines_2026-09b.zim|u|1" \
+  "pub|nhsXuk_en_medicines_2026-10.zim|u|1"
+fl_expect "vs2_en_all_2026-09b.zim" "vs2_en_all_2026-11.zim" \
+  "VS2 suffixed local is stripped to its stem and matches" \
+  "pub|vs2_en_all_2026-11.zim|u|1"
+# Plain first: a compare that ignored the suffix would keep the first-seen 2026-11.
+fl_expect "vs3_en_all_2025-03.zim" "vs3_en_all_2026-11a.zim" \
+  "VS3 best_date: suffixed rebuild sorts above the plain same month" \
+  "pub|vs3_en_all_2026-11.zim|u|1" \
+  "pub|vs3_en_all_2026-11a.zim|u|1" \
+  "pub|vs3_en_all_2026-10.zim|u|1"
+fl_expect "wikihow_en_maxi_2025-06.zim" "wikihow_en_all_2026-10.zim" \
+  "VS4a alt-name: suffixed entry is dated, not taken as an undated early match" \
+  "pub|wikihow_en_all_2026-09a.zim|u|1" \
+  "pub|wikihow_en_all_2026-10.zim|u|1"
+fl_expect "wikihow_en_maxi_2025-06.zim" "wikihow_en_all_2026-09a.zim" \
+  "VS4b alt-name: a suffixed-only entry resolves" \
+  "pub|wikihow_en_all_2026-09a.zim|u|1"
+fl_expect "wiktionary_en_all_maxi_2025-06.zim" "wiktionary_en_all_nopic_2026-09a.zim" \
+  "VS5 wiktionary nopic fallback accepts a suffixed entry" \
+  "pub|wiktionary_en_all_nopic_2026-09a.zim|u|1"
+fl_expect "vs6_en_all_2025-03.zim" "vs6_en_all_2026-08b.zim" \
+  "VS6 one suffix letter accepted, two rejected" \
+  "pub|vs6_en_all_2026-09ab.zim|u|1" \
+  "pub|vs6_en_all_2026-08b.zim|u|1"
+fl_nomatch "vs6_en_all_2025-03.zim" \
+  "VS6b suffix does not widen the stem (X_extra_… is another title)" \
+  "pub|vs6_en_all_extra_2026-09b.zim|u|1"
+i1_e2e "nhs.uk_en_medicines_2025-03.zim" "nhs.uk_en_medicines_2026-09b.zim" \
+  "VS7 suffixed catalog entry drives an update end-to-end (the Pi case)"
+
+# ======================================================================
 echo; echo "########## M1 — transient (rc2) stops retrying vs definitive (rc1) re-downloads ##########"
 # verify_downloaded_file returns 2 for a TRANSIENT metalink fetch error and 1 for
 # a DEFINITIVE integrity failure. download_file's retry loop must diverge on them:
@@ -682,10 +720,14 @@ rm -rf "$TEMP_DIR"; mkdir -p "$TEMP_DIR"
 : > "$TEMP_DIR/dead.zim.part"; : > "$TEMP_DIR/dead.zim.part.aria2"
 : > "$TEMP_DIR/sk_2025-06.zim.part"; : > "$TEMP_DIR/sk_2025-06.zim.part.aria2"
 : > "$TEMP_DIR/sk_maxi_2025-06.zim.part"; : > "$TEMP_DIR/sk_maxi_2025-06.zim.part.aria2"   # another flavour: not protected by stem sk
+: > "$TEMP_DIR/sk_2026-06a.zim.part"         # same-month rebuild of stem sk: kept
+: > "$TEMP_DIR/sk_2026-06ab.zim.part"        # two letters: not a version, removed
+: > "$TEMP_DIR/sk_maxi_2026-06a.zim.part"    # another flavour, suffixed: removed
 _drop_dead_partials "live.zim.part" "other.zim.part" "$(_zim_stem sk_2025-01.zim)" >/dev/null
 rp_left=$(find "$TEMP_DIR" -mindepth 1 -printf '%f\n' | sort | tr '\n' ' ')
-[ "$rp_left" = "live.zim.part live.zim.part.aria2 sk_2025-06.zim.part sk_2025-06.zim.part.aria2 " ] \
-  && pass "RP _drop_dead_partials keeps offered and skipped-stem partials, removes the rest" || fail "RP _drop_dead_partials left: '$rp_left'"
+[ "$rp_left" = "live.zim.part live.zim.part.aria2 sk_2025-06.zim.part sk_2025-06.zim.part.aria2 sk_2026-06a.zim.part " ] \
+  && pass "RP _drop_dead_partials keeps offered and skipped-stem partials (suffixed too), removes the rest" || fail "RP _drop_dead_partials left: '$rp_left'"
+[ "$(_zim_stem sk_2026-06a.zim)" = sk ] && pass "VS12 _zim_stem strips a suffixed version" || fail "VS12 _zim_stem sk_2026-06a.zim gave '$(_zim_stem sk_2026-06a.zim)'"
 TEMP_DIR="$RP_SAVED_TEMP"
 
 # ======================================================================
@@ -842,9 +884,11 @@ echo; echo "########## M8 — analyze_updates decision arms (size / newer) #####
 # veto is actually reachable. UPDATE_CRITERIA restored to all at the end (leak is
 # bidirectional).
 BACKGROUND=false
-m8_run(){ # $1=local dated .zim  $2=catalog field-2 dated .zim  $3=field-4  $4=criteria  [$5=local bytes, default 100] -> M8_HIT
+m8_run(){ # $1=local .zim  $2=catalog field-2 dated .zim  $3=field-4  $4=criteria  [$5=local bytes, default 100]  [$6=local mtime for touch -d] -> M8_HIT
     rm -f "$WORK_DIR"/*.zim 2>/dev/null
     head -c "${5:-100}" /dev/zero > "$WORK_DIR/$1"
+    # After the write (which sets mtime to now): an undated local is dated by mtime.
+    [ -n "${6:-}" ] && touch -d "$6" "$WORK_DIR/$1"
     printf 'pub|%s|https://lb.download.kiwix.org/zim/x/%s|%s\n' "$2" "$2" "$3" > "$LIBRARY_CACHE"
     FILES_TO_UPDATE=()
     UPDATE_CRITERIA="$4" analyze_updates >/dev/null 2>&1
@@ -887,6 +931,22 @@ m8_run "m8n_2025-08.zim" "m8n_2025-09.zim" 40 newer
 [ "$M8_HIT" = no ] && pass "M8 newer: newer catalog but ratio 40<50 => vetoed as different content (not flagged)" || fail "M8 newer: <50% veto did not fire"
 m8_run "m8n2_2025-08.zim" "m8n2_2025-09.zim" 60 newer
 [ "$M8_HIT" = yes ] && pass "M8 newer: newer catalog + ratio 60>=50 => Update needed (flagged)" || fail "M8 newer: 60% not flagged"
+
+# --- version suffix in the decision arms. field-4 100 vs the 100-byte local:
+# not above local_kib_size (1024), so the size rule is silent and only the
+# version compare can flag; ratio 100 passes both vetoes.
+m8_run "vs8_2026-11.zim" "vs8_2026-11a.zim" 100 newer
+[ "$M8_HIT" = yes ] && pass "VS8 newer: same-month rebuild (2026-11 -> 2026-11a) flagged" || fail "VS8 newer: 2026-11a not seen as newer than 2026-11"
+m8_run "vs9_2026-11.zim" "vs9_2026-11a.zim" 100 all
+[ "$M8_HIT" = yes ] && pass "VS9 all: same-month rebuild (2026-11 -> 2026-11a) flagged" || fail "VS9 all: 2026-11a not seen as newer than 2026-11"
+m8_run "vs10_2026-11.zim" "vs10_2026-11a.zim" 40 all
+[ "$M8_HIT" = no ] && pass "VS10 all: newer-only rebuild at ratio 40<90 still vetoed" || fail "VS10 all: 90% veto bypassed for a suffixed rebuild"
+# Undated local: dated by mtime (2020), against a suffixed remote's month. Pre-fix
+# `date -d 2026-11a-01` failed and the remote timestamp silently became 0.
+for crit in newer all; do
+    m8_run "vs11.zim" "vs11_2026-11a.zim" 100 "$crit" 100 2020-01-01
+    [ "$M8_HIT" = yes ] && pass "VS11 $crit: undated old local vs suffixed remote flagged (timestamp path)" || fail "VS11 $crit: suffixed remote timestamp not derived"
+done
 UPDATE_CRITERIA=all   # restore the harness global (leak is bidirectional)
 
 # ======================================================================

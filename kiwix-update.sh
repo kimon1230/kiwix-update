@@ -20,6 +20,10 @@ CRITERIA_FILE="${WORK_DIR}/.kiwix_update_criteria"
 LOCK_FILE="${WORK_DIR}/.kiwix_run.lock"
 LIBRARY_CACHE="${WORK_DIR}/.kiwix_library_cache"
 KIWIX_LIBRARY_API="https://opds.library.kiwix.org/catalog/v2/entries?count=-1"
+# Version tag of a Kiwix file name: _YYYY-MM, plus one lowercase letter for a
+# same-month rebuild (_2026-09b). Compares correctly as a string. Use UNQUOTED on
+# the right of =~ (quoted, it would match literally).
+ZIM_VER_RE='[0-9]{4}-[0-9]{2}[[:lower:]]?'
 
 # Default values
 YES_TO_ALL=false
@@ -562,13 +566,13 @@ fetch_library_data() {
 find_latest_zim() {
     local local_filename="$1"
     local base_name="${local_filename%.zim}"
-    # Kiwix names its files with a trailing _YYYY-MM version date. Strip it so the
-    # undated title stem can match the catalog's (newer-)dated entries via the
-    # dated-version branch below. Without this, a dated local file only matched a
-    # catalog entry of the *same* date — i.e. only when no update existed (issue #1).
-    # Undated local names (no trailing _YYYY-MM) are a no-op here. Only _YYYY-MM is
-    # in scope (Kiwix's canonical form); _YYYY-MM-DD / year-only forms are not handled.
-    if [[ "$base_name" =~ ^(.+)_[0-9]{4}-[0-9]{2}$ ]]; then
+    # Kiwix names its files with a trailing version (_YYYY-MM, or _YYYY-MMx for a
+    # same-month rebuild; see ZIM_VER_RE). Strip it so the undated title stem can
+    # match the catalog's (newer-)dated entries via the dated-version branch below.
+    # Without this, a dated local file only matched a catalog entry of the *same*
+    # date — i.e. only when no update existed (issue #1). Undated local names are a
+    # no-op here; _YYYY-MM-DD / year-only forms are not handled.
+    if [[ "$base_name" =~ ^(.+)_${ZIM_VER_RE}$ ]]; then
         base_name="${BASH_REMATCH[1]}"
     fi
     local alt_name=""
@@ -620,8 +624,8 @@ find_latest_zim() {
         fi
         
         # Alternative name match
-        if [ -n "${alt_name}" ] && [[ "$file_base" =~ ^${alt_re}(_[0-9]{4}-[0-9]{2})?$ ]]; then
-            if [[ "$file_base" =~ _[0-9]{4}-[0-9]{2}$ ]]; then
+        if [ -n "${alt_name}" ] && [[ "$file_base" =~ ^${alt_re}(_${ZIM_VER_RE})?$ ]]; then
+            if [[ "$file_base" =~ _${ZIM_VER_RE}$ ]]; then
                 local date_part="${file_base##*_}"
                 if [ -z "$best_date" ] || [[ "$date_part" > "$best_date" ]]; then
                     best_date="$date_part"
@@ -634,7 +638,7 @@ find_latest_zim() {
         fi
         
         # Dated version match
-        if [[ "$file_base" =~ ^${base_re}_[0-9]{4}-[0-9]{2}$ ]]; then
+        if [[ "$file_base" =~ ^${base_re}_${ZIM_VER_RE}$ ]]; then
             local date_part="${file_base##*_}"
             if [ -z "$best_date" ] || [[ "$date_part" > "$best_date" ]]; then
                 best_date="$date_part"
@@ -655,7 +659,7 @@ find_latest_zim() {
             local nopic_re="${nopic_name//./\\.}"
             while IFS='|' read -r publisher filename path size; do
                 local file_base="${filename%.zim}"
-                if [[ "$file_base" =~ ^${nopic_re}(_[0-9]{4}-[0-9]{2})?$ ]]; then
+                if [[ "$file_base" =~ ^${nopic_re}(_${ZIM_VER_RE})?$ ]]; then
                     result="${publisher}|${filename}|${path}|${size}"
                     break
                 fi
@@ -1340,10 +1344,11 @@ _prune_temp_dir() {
     return 0
 }
 
-# Undated stem of a .zim name, as find_latest_zim matches it: X_2025-01.zim -> X.
+# Undated stem of a .zim name, as find_latest_zim matches it: X_2025-01.zim and
+# X_2025-01a.zim -> X.
 _zim_stem() {
     local stem="${1%.zim}"
-    [[ "$stem" =~ ^(.+)_[0-9]{4}-[0-9]{2}$ ]] && stem="${BASH_REMATCH[1]}"
+    [[ "$stem" =~ ^(.+)_${ZIM_VER_RE}$ ]] && stem="${BASH_REMATCH[1]}"
     printf '%s' "$stem"
 }
 
@@ -1351,7 +1356,7 @@ _zim_stem() {
 # a version it has since replaced). They can never resume, yet would otherwise
 # refuse every run until pruned by age. Each argument protects partials:
 # <name>.zim.part of a file the catalog offers (exact), or the stem of a local
-# file skipped this run (<stem>.zim.part, <stem>_YYYY-MM.zim.part), so a
+# file skipped this run (<stem>.zim.part, <stem>_YYYY-MM[x].zim.part), so a
 # transient catalog glitch does not cost a skipped file its progress (except a
 # title find_latest_zim maps to an alias name, e.g. wikihow_en_maxi; at worst a
 # re-download). Echoes bytes freed.
@@ -1362,7 +1367,7 @@ _drop_dead_partials() {
         alive=false
         for keep in "$@"; do
             case "$base" in
-                "$keep"|"$keep.zim.part"|"$keep"_[0-9][0-9][0-9][0-9]-[0-9][0-9].zim.part) alive=true; break ;;
+                "$keep"|"$keep.zim.part"|"$keep"_[0-9][0-9][0-9][0-9]-[0-9][0-9].zim.part|"$keep"_[0-9][0-9][0-9][0-9]-[0-9][0-9][[:lower:]].zim.part) alive=true; break ;;
             esac
         done
         if $alive; then continue; fi
@@ -1833,16 +1838,17 @@ analyze_updates() {
             newer)
                 local remote_date="" local_date="" local_timestamp="" remote_timestamp=""
                 
-                # Extract date from remote filename
-                if [[ "$latest_name" =~ _([0-9]{4}-[0-9]{2})$ ]]; then
+                # Extract version from remote filename (the timestamp drops a
+                # same-month suffix letter: `date` cannot parse 2026-11a-01)
+                if [[ "$latest_name" =~ _(${ZIM_VER_RE})$ ]]; then
                     remote_date="${BASH_REMATCH[1]}"
-                    remote_timestamp=$(date -d "${remote_date}-01" +%s 2>/dev/null || echo "0")
+                    remote_timestamp=$(date -d "${remote_date%[[:lower:]]}-01" +%s 2>/dev/null || echo "0")
                 fi
-                
-                # Extract date from local filename
-                if [[ "${filename%.zim}" =~ _([0-9]{4}-[0-9]{2})$ ]]; then
+
+                # Extract version from local filename
+                if [[ "${filename%.zim}" =~ _(${ZIM_VER_RE})$ ]]; then
                     local_date="${BASH_REMATCH[1]}"
-                    local_timestamp=$(date -d "${local_date}-01" +%s 2>/dev/null || echo "0")
+                    local_timestamp=$(date -d "${local_date%[[:lower:]]}-01" +%s 2>/dev/null || echo "0")
                 else
                     local_timestamp=$(stat -c%Y "$f")
                 fi
@@ -1888,20 +1894,29 @@ analyze_updates() {
                 
                 # Check if newer
                 local remote_date="" local_date="" local_timestamp="" remote_timestamp=""
-                
-                if [[ "$latest_name" =~ _([0-9]{4}-[0-9]{2})$ ]]; then
+
+                if [[ "$latest_name" =~ _(${ZIM_VER_RE})$ ]]; then
                     remote_date="${BASH_REMATCH[1]}"
-                    remote_timestamp=$(date -d "${remote_date}-01" +%s 2>/dev/null || echo "0")
+                    remote_timestamp=$(date -d "${remote_date%[[:lower:]]}-01" +%s 2>/dev/null || echo "0")
                 fi
-                
-                if [[ "${filename%.zim}" =~ _([0-9]{4}-[0-9]{2})$ ]]; then
+
+                if [[ "${filename%.zim}" =~ _(${ZIM_VER_RE})$ ]]; then
                     local_date="${BASH_REMATCH[1]}"
-                    local_timestamp=$(date -d "${local_date}-01" +%s 2>/dev/null || echo "0")
+                    local_timestamp=$(date -d "${local_date%[[:lower:]]}-01" +%s 2>/dev/null || echo "0")
                 else
                     local_timestamp=$(stat -c%Y "$f")
                 fi
-                
-                if [ -n "$remote_timestamp" ] && [ "$remote_timestamp" -gt "$local_timestamp" ]; then
+
+                # Both versioned: compare as strings, like the newer arm, so a
+                # same-month rebuild (2026-11 -> 2026-11a) counts as newer.
+                local is_newer=false
+                if [ -n "$local_date" ] && [ -n "$remote_date" ]; then
+                    [[ "$remote_date" > "$local_date" ]] && is_newer=true
+                elif [ -n "$remote_timestamp" ] && [ "$remote_timestamp" -gt "$local_timestamp" ]; then
+                    is_newer=true
+                fi
+
+                if $is_newer; then
                     reasons+=("newer: $latest_name")
                     if [ ${#reasons[@]} -eq 1 ]; then  # Only newer, not bigger
                         local size_ratio=100
